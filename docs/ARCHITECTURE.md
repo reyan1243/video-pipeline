@@ -57,8 +57,8 @@ sequenceDiagram
     API-->>Client: 200 {job_id, status: queued}
     API->>Worker: schedule run_job(job_id)
 
-    Note over Worker: acquires the pipeline lock —<br/>one job runs at a time per process
-    Worker->>Worker: VideoLayerPipeline.run()<br/>detect &rarr; segment &rarr; track &rarr; clean &rarr; export
+    Note over Worker: acquires the pipeline lock, one job runs at a time per process
+    Worker->>Worker: VideoLayerPipeline.run(): detect, segment, track, clean, export
     Worker->>Store: update status = done | failed
 
     Client->>API: GET /jobs/{id} (poll)
