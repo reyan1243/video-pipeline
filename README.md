@@ -17,6 +17,10 @@ automatic re-detection if tracking quality craters) follows it across every
 frame; a morphological cleanup pass closes small occlusion gaps; the result
 is exported as two videos.
 
+![Pipeline flow](docs/images/pipeline-flow.png)
+
+![API request lifecycle](docs/images/api-sequence.png)
+
 ## Install
 
 ```bash
