@@ -1,0 +1,12 @@
+opencv-python-headless
+numpy
+scipy
+pillow
+torch
+transformers
+accelerate
+timm
+fastapi
+uvicorn[standard]
+python-multipart
+httpx
