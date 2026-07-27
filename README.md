@@ -5,7 +5,8 @@ or any object), segments and tracks it across every frame, and exports two
 stackable output videos: a **person** layer and a **background** layer.
 Compositing text/captions on top of those is out of scope — see
 [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) for the full scope and known
-gaps.
+gaps, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the pieces
+fit together.
 
 ## How it works
 
