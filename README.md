@@ -26,8 +26,8 @@ is exported as two videos.
 pip install -r requirements.txt
 ```
 
-Also requires `ffmpeg` on `PATH` (used for the `webm_alpha` export format; not
-needed for `fill_matte`, the default). On macOS: `brew install ffmpeg`.
+Also requires `ffmpeg` on `PATH` — every export format encodes through it.
+On macOS: `brew install ffmpeg`.
 
 ## Run it
 
@@ -35,18 +35,29 @@ needed for `fill_matte`, the default). On macOS: `brew install ffmpeg`.
 
 ```bash
 ./scripts/run_pipeline.sh tests/fixtures/short_clip.mp4 \
-  --prompt "person" --output-dir out/ --person-format fill_matte
+  --prompt "person" --output-dir out/ --person-format matte
 ```
 
 Or without the wrapper script:
 
 ```bash
 python -m pipeline tests/fixtures/short_clip.mp4 \
-  --prompt "person" --output-dir out/ --person-format fill_matte
+  --prompt "person" --output-dir out/ --person-format matte
 ```
 
-Flags: `--person-format {fill_matte,webm_alpha}` (default `fill_matte`),
-`--num-seed-candidates` (default 12), `--mask-close-kernel-size` (default 45).
+Flags:
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--person-format {matte,fill_matte,webm_alpha}` | `matte` | `matte` emits only the silhouette |
+| `--num-seed-candidates` | `12` | stops early once a candidate scores ≥ 0.97 |
+| `--mask-close-kernel-size` | `7` | large values bridge arm-to-torso gaps and fill them solid |
+| `--feather-sigma` | `1.0` | gaussian edge feather in px; `0` disables |
+| `--temporal-smoothing` | off | 3-tap median across frames; removes edge jitter, costs a frame of lag |
+| `--max-segments-per-direction` | `20` | re-seed budget |
+| `--max-segment-frames` | `600` | caps VRAM growth (~18 MB/frame, never evicted) |
+| `--cpu-offload` | off | session state in host RAM; removes the frame ceiling, ~22% slower |
+| `--model-size {large,base-plus,small,tiny}` | `large` | smaller is faster and measurably less accurate |
 
 ### Option B — FastAPI service (local)
 
@@ -101,13 +112,26 @@ tested — no CUDA-capable GPU available to validate it against).
 
 ## Output formats
 
-- **`fill_matte`** (default): two plain H.264 videos — the person on black
-  (`person_fill.mp4`) and a grayscale matte (`person_matte.mp4`, white =
-  subject). Combine them with a standard **track matte / luma matte**
-  operation — a built-in effect in Premiere Pro ("Track Matte Key") and
-  DaVinci Resolve ("Composite Using Matte"), or `ffmpeg -i fill.mp4 -i
-  matte.mp4 -filter_complex alphamerge out.mov` if doing it in code. Works
-  with literally any downstream tool — nothing to silently get wrong.
+- **`matte`** (default): one grayscale H.264 video (`person_matte.mp4`, white
+  = subject), encoded at CRF 18 with `-tune grain` — which measures ~3.2 dB
+  better than plain CRF 18 on a hard-edged matte, because `grain` disables
+  the psychovisual and deblocking behaviour that smears sharp edges.
+  This is all a compositor needs: the subject's *colour* is the source video
+  the consumer already has, so a cut-out copy of it plus a byte-identical
+  "background" is pure egress. Roughly **2.5 MB per minute**. It is also the
+  only format with no dark rim (see `fill_matte` below).
+- **`fill_matte`**: two H.264 videos — the person on black
+  (`person_fill.mp4`) and a grayscale matte (`person_matte.mp4`). Combine
+  them with a standard **track matte / luma matte** operation — a built-in
+  effect in Premiere Pro ("Track Matte Key") and DaVinci Resolve ("Composite
+  Using Matte"), or `ffmpeg -i fill.mp4 -i matte.mp4 -filter_complex
+  alphamerge out.mov` in code.
+  **Known rim:** zeroing the non-subject pixels creates a maximal-contrast
+  black step exactly on the silhouette, and lossy 4:2:0 encoding then bleeds
+  that black 1–3 px *into* the subject through chroma subsampling and DCT
+  ringing. Raising the encoder from `mp4v` to H.264 CRF 18 shrinks it
+  substantially but cannot remove it — it is inherent to the format. Use
+  `matte` if that matters.
 - **`webm_alpha`**: one file (`person.webm`) with a true alpha channel
   (VP9/yuva420p). Only use this if the downstream consumer has *confirmed*
   it decodes VP9 alpha correctly — plain `ffmpeg -i person.webm` (the

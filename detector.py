@@ -11,7 +11,7 @@ import torch
 from PIL import Image
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
-from device import pick_device
+from device import autocast, enable_fast_matmul, pick_device
 from datatypes import BoundingBox
 
 
@@ -40,13 +40,16 @@ class SubjectDetector:
         self.box_threshold = box_threshold
         self.text_threshold = text_threshold
         self.device = device or pick_device()
+        enable_fast_matmul()
 
         self.processor = AutoProcessor.from_pretrained(self.MODEL_ID)
         self.model = AutoModelForZeroShotObjectDetection.from_pretrained(self.MODEL_ID).to(self.device).eval()
 
     def detect(self, frame_rgb: Image.Image) -> BoundingBox | None:
         inputs = self.processor(images=frame_rgb, text=self.prompt, return_tensors="pt").to(self.device)
-        with torch.no_grad():
+        # See tracker.py: no_grad rather than inference_mode, because
+        # post_process_grounded_object_detection touches these tensors below.
+        with torch.no_grad(), autocast(self.device):
             outputs = self.model(**inputs)
 
         results = self.processor.post_process_grounded_object_detection(

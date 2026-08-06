@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from api.jobs import JobStore, run_job
 
 DATA_DIR = Path(os.environ.get("VIDEO_PIPELINE_DATA_DIR", "data/jobs"))
-VALID_PERSON_FORMATS = ("webm_alpha", "fill_matte")
+VALID_PERSON_FORMATS = ("matte", "fill_matte", "webm_alpha")
 
 app = FastAPI(title="video-layer-service API", version="0.1.0")
 store = JobStore()
@@ -49,7 +49,7 @@ async def create_job(
     background_tasks: BackgroundTasks,
     video: UploadFile,
     prompt: str = Form(...),
-    person_format: str = Form("fill_matte"),
+    person_format: str = Form("matte"),
     num_seed_candidates: int = Form(12),
     mask_close_kernel_size: int = Form(45),
 ) -> JobCreatedResponse:
@@ -83,8 +83,12 @@ def get_job(job_id: str) -> JobStatusResponse:
 
     person_url = matte_url = background_url = None
     if job.status == "done" and job.result is not None:
-        person_url = f"/jobs/{job_id}/download/person"
-        background_url = f"/jobs/{job_id}/download/background"
+        # "matte" produces only the silhouette, so advertise exactly what exists —
+        # a URL that 404s on download is worse than an absent one.
+        if job.result.person_path is not None:
+            person_url = f"/jobs/{job_id}/download/person"
+        if job.result.background_path is not None:
+            background_url = f"/jobs/{job_id}/download/background"
         if job.result.matte_path is not None:
             matte_url = f"/jobs/{job_id}/download/matte"
 
@@ -117,4 +121,4 @@ def download_artifact(job_id: str, artifact: str) -> FileResponse:
     if path is None:
         raise HTTPException(404, f"{artifact!r} was not produced for this job's format")
 
-    return FileResponse(path)
+    return FileResponse(path, filename=path.name)

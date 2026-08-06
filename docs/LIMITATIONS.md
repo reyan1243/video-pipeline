@@ -6,12 +6,22 @@
   impractically slow. Apple Silicon (MPS) works but is roughly 4x slower
   than a CUDA GPU (measured: ~35 min vs. ~9 min for the same tracking pass
   on a ~12s clip).
-- `ffmpeg` must be on `PATH` (used for the `webm_alpha` export format; not
-  needed for `fill_matte`).
+- `ffmpeg` must be on `PATH` — every export format encodes through it.
 - ~1.8GB of model weights (`grounding-dino-base` + `sam2.1-hiera-large`) are
   downloaded on first run if not already cached locally.
 - Runtime scales with clip length (roughly linear, based on measurements so
   far). No hard duration cap is enforced by the code.
+- **VRAM grows linearly within a tracking segment.** SAM2 retains roughly
+  18 MB per frame per tracked object for the lifetime of a session and never
+  evicts it, so an undisrupted clip would run as one unbounded session and
+  exhaust a 24GB card somewhere around 900–1000 frames (~33s at 30fps).
+  `TrackerConfig.max_segment_frames` (default 600) bounds this by splitting
+  into fixed-length sessions; a length-capped split resumes from the last
+  good mask's own bounding box, not a fresh detection, so subject identity
+  cannot drift at the seam. `--cpu-offload` removes the ceiling entirely at
+  roughly +22% wall-clock.
+- **Host RAM** peaks at one full-resolution `uint8` mask per frame — 0.9 MB
+  per frame at 720×1280, so ~1.6 GB for a minute at 30fps.
 
 ## Not supported
 
@@ -52,11 +62,14 @@
 
 ## Output format notes
 
-- `fill_matte` (default): two H.264 videos — person on black plus a
-  grayscale matte. Works with any downstream tool via a standard track-matte
-  / luma-matte operation (a built-in effect in Premiere Pro and DaVinci
-  Resolve, or `ffmpeg -i fill.mp4 -i matte.mp4 -filter_complex alphamerge`
-  in code).
+- `matte` (default): one grayscale H.264 video. All a compositor needs, since
+  the subject's colour is the source video the consumer already holds.
+- `fill_matte`: two H.264 videos — person on black plus a grayscale matte.
+  Works with any downstream tool via a standard track-matte / luma-matte
+  operation (a built-in effect in Premiere Pro and DaVinci Resolve, or
+  `ffmpeg -i fill.mp4 -i matte.mp4 -filter_complex alphamerge` in code).
+  Carries an unavoidable 1–3 px dark rim — lossy 4:2:0 encoding bleeds the
+  black fill into the subject's edge pixels. `matte` does not.
 - `webm_alpha` (opt-in): one file with a real alpha channel, but most
   default VP9 decoders — including plain `ffmpeg -i file.webm` — silently
   report it as fully opaque instead of erroring. Only use this format if the

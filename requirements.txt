@@ -2,8 +2,16 @@ opencv-python-headless
 numpy
 scipy
 pillow
-torch
-transformers
+# cu124 wheels run on driver CUDA 12.4 and newer, which is the safe choice across
+# RunPod hosts. Install from https://download.pytorch.org/whl/cu124 — a bare
+# `pip install torch` resolves to a build that needs 12.8+ and fails at import.
+# torchvision is ABI-locked to a specific torch build; mismatching them breaks
+# every transformers import with `operator torchvision::nms does not exist`,
+# because transformers/image_utils.py imports torchvision at module load.
+torch==2.6.0
+torchvision==0.21.0
+# Sam2Model / Sam2VideoModel / Sam2VideoProcessor are recent, fast-moving APIs.
+transformers>=4.56,<5
 accelerate
 timm
 fastapi

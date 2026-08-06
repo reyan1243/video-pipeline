@@ -46,7 +46,18 @@ class TestTrackerConfig(unittest.TestCase):
         self.assertEqual(config.object_score_threshold, 0.0)
         self.assertEqual(config.iou_drop_threshold, 0.4)
         self.assertEqual(config.area_ratio_bounds, (0.3, 1 / 0.3))
-        self.assertEqual(config.max_segments_per_direction, 8)
+        # Raised from 8: a busy clip exhausted the budget, the direction stopped
+        # early, and the exporter then rejected the whole run for incomplete
+        # coverage — after all the GPU time had already been spent.
+        self.assertEqual(config.max_segments_per_direction, 20)
+
+    def test_segment_length_is_capped_to_bound_vram(self):
+        # SAM2 retains ~18 MB/frame per session with no eviction, so an
+        # undisrupted clip becomes one unbounded session and OOMs a 24 GB card
+        # around 900-1000 frames. This cap is what keeps peak VRAM flat.
+        config = TrackerConfig()
+        self.assertLessEqual(config.max_segment_frames, 900)
+        self.assertFalse(config.cpu_offload)
 
 
 if __name__ == "__main__":
