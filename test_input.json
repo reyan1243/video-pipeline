@@ -1,0 +1,8 @@
+{
+  "input": {
+    "video_url": "https://REPLACE-ME/clip.mp4",
+    "prompt": "person",
+    "start_time": 0,
+    "end_time": 10
+  }
+}

@@ -1,0 +1,62 @@
+# RunPod Serverless image.
+#
+# Build for linux/amd64 explicitly — RunPod hosts are x86, and an arm64 image
+# built on an Apple Silicon Mac will push fine and then fail to start with an
+# exec-format error that is not obvious from the logs.
+#
+#   docker build --platform linux/amd64 -f Dockerfile.serverless -t YOUR_USER/video-matte:v1 .
+#   docker push YOUR_USER/video-matte:v1
+#
+# Layer order matters. Weights are ~1.8 GB and go in *before* the source, so
+# editing code rebuilds only the last, cheap layer.
+
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# cu124 wheels first, so the bare `torch` line in requirements.txt is already
+# satisfied and pip does not re-resolve it to a build that needs driver 12.8+.
+# These wheels bundle the CUDA runtime, which is most of the image size.
+RUN pip install --no-cache-dir \
+        "torch==2.6.0" "torchvision==0.21.0" \
+        --index-url https://download.pytorch.org/whl/cu124
+
+COPY requirements.txt /app/requirements.txt
+# runpod is pinned deliberately. 1.7.11-1.10.0 funnel nearly every job onto a
+# single worker while the rest sit idle, and 1.9.0-1.10.1 can log "Worker is
+# unhealthy, exiting" and then keep serving jobs anyway. A Python 3.9 base
+# silently resolves to the buggy 1.9.1 — hence python:3.11 above.
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir "runpod>=1.11.0,<1.12" boto3
+
+# HF_HOME must be identical at build and run time, or the worker re-downloads
+# 1.8 GB on every cold start — on the meter, since start time is billed.
+ENV HF_HOME=/opt/hf
+ENV HF_HUB_DISABLE_TELEMETRY=1
+ENV TOKENIZERS_PARALLELISM=false
+
+# Hardcoded, not an ARG: RunPod's hosted GitHub build cannot pass --build-arg,
+# so a build-arg-driven model choice would silently take the default there and
+# diverge from a local build. Change the literal to swap models.
+RUN python -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('IDEA-Research/grounding-dino-base'); \
+snapshot_download('facebook/sam2.1-hiera-large'); \
+print('weights cached')"
+
+COPY . /app
+
+# Fail the build here rather than on the first request. The import chain is the
+# thing that historically broke (torch/torchvision ABI, transformers pulling in
+# torchvision at module load), and a broken worker looks like a queue stall.
+RUN python -c "\
+import sys; sys.path.insert(0, '/app'); \
+from transformers import Sam2VideoModel, Sam2Model, AutoProcessor; \
+import tracker, segmenter, detector, exporter, mask_ops, video_source; \
+print('import chain OK')"
+
+CMD ["python", "-u", "/app/rp_handler.py"]
