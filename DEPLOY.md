@@ -198,6 +198,7 @@ progress updates put a string in `output` mid-flight. A **404 is terminal**
 ```json
 {
   "ok": true,
+  "matte_key": "mattes/9f2c.../person_matte.mp4",
   "matte_url": "https://...person_matte.mp4?X-Amz-Signature=...",
   "cached": false,
   "frames": 900,
@@ -211,6 +212,10 @@ progress updates put a string in `output` mid-flight. A **404 is terminal**
   "url_expires_in_seconds": 86400
 }
 ```
+
+`matte_key` is the durable reference — **store this**. `matte_url` is a
+convenience for testing and expires after `URL_TTL_SECONDS`; re-presign from the
+key rather than persisting the URL.
 
 `cached: true` means the identical video and settings were processed before and
 the existing file was returned — no GPU time, no charge.

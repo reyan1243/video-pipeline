@@ -313,6 +313,7 @@ def handler(job):
             # a heartbeat lapse. Returning the existing object costs nothing.
             return {
                 "ok": True,
+                "matte_key": key,
                 "matte_url": _presign(key),
                 "cached": True,
                 "processing_seconds": round(time.time() - started, 1),
@@ -378,6 +379,10 @@ def handler(job):
         runpod.serverless.progress_update(job, "uploading")
         return {
             "ok": True,
+            # The key is the durable reference — store this. The URL is a
+            # convenience for testing and expires after URL_TTL_SECONDS; callers
+            # should re-presign from the key rather than persist the URL.
+            "matte_key": key,
             "matte_url": _upload(Path(export.matte_path), key),
             "cached": False,
             "frames": metadata.frame_count,
