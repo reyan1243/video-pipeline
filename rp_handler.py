@@ -45,6 +45,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 
 import boto3
@@ -87,6 +88,10 @@ MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_BYTES", 2 * 1024**3))
 MAX_MASK_BYTES = int(os.environ.get("MAX_MASK_BYTES", 8 * 1024**3))
 MAX_SEGMENTS_PER_DIRECTION = int(os.environ.get("MAX_SEGMENTS_PER_DIRECTION", 20))
 MAX_SEGMENT_FRAMES = int(os.environ.get("MAX_SEGMENT_FRAMES", 600))
+# Cap matte height (0 = source resolution). SAM2 decodes masks at 256x256
+# internally, so 960 on a 1080p source discards almost no real detail while
+# quartering mask cleanup, encoding and RAM — which together outweigh tracking.
+MAX_MASK_HEIGHT = int(os.environ.get("MAX_MASK_HEIGHT", 0))
 MODEL_SIZE = os.environ.get("MODEL_SIZE", "large")
 
 MODEL_IDS = {
@@ -107,6 +112,7 @@ _MODEL_ID = MODEL_IDS.get(MODEL_SIZE, MODEL_IDS["large"])
 _TRACKER_CONFIG = TrackerConfig(
     max_segments_per_direction=MAX_SEGMENTS_PER_DIRECTION,
     max_segment_frames=MAX_SEGMENT_FRAMES,
+    max_mask_height=MAX_MASK_HEIGHT,
 )
 
 _detector = SubjectDetector(prompt="person", device=DEVICE)
@@ -284,6 +290,7 @@ def handler(job):
     close_kernel = int(job_input.get("mask_close_kernel_size", DEFAULT_CLOSE_KERNEL_SIZE))
     feather_sigma = float(job_input.get("feather_sigma", DEFAULT_FEATHER_SIGMA))
     smoothing = bool(job_input.get("temporal_smoothing", False))
+    max_mask_height = int(job_input.get("max_mask_height", MAX_MASK_HEIGHT))
     start_time = job_input.get("start_time")
     end_time = job_input.get("end_time")
     start_time = float(start_time) if start_time is not None else None
@@ -295,6 +302,7 @@ def handler(job):
         "close": close_kernel,
         "feather": feather_sigma,
         "smoothing": smoothing,
+        "max_mask_height": max_mask_height,
         "start": start_time,
         "end": end_time,
         "model": _MODEL_ID,
@@ -345,6 +353,10 @@ def handler(job):
                 frames=metadata.frame_count,
                 resolution=f"{metadata.width}x{metadata.height}",
             )
+
+        # TrackerConfig is frozen, so a per-request override rebuilds it. The
+        # tracker reads self.config on every frame, so reassigning is enough.
+        _tracker.config = replace(_TRACKER_CONFIG, max_mask_height=max_mask_height)
 
         _detector.prompt = _normalize_prompt(prompt)
         _segmenter.num_candidates = num_seed_candidates

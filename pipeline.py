@@ -162,6 +162,14 @@ def main(argv: list[str] | None = None) -> None:
         help="hold session state in host RAM; removes the frame ceiling, ~22%% slower",
     )
     tracking.add_argument(
+        "--max-mask-height",
+        type=int,
+        default=TrackerConfig().max_mask_height,
+        help="cap matte height, preserving aspect (0 = source). SAM2 decodes masks at "
+        "256x256 internally, so 960 on a 1080p source costs almost no real detail and "
+        "quarters cleanup, encode and RAM",
+    )
+    tracking.add_argument(
         "--model-size",
         choices=sorted(MODEL_IDS),
         default="large",
@@ -179,6 +187,7 @@ def main(argv: list[str] | None = None) -> None:
             max_segments_per_direction=args.max_segments_per_direction,
             max_segment_frames=args.max_segment_frames,
             cpu_offload=args.cpu_offload,
+            max_mask_height=args.max_mask_height,
         ),
         mask_close_kernel_size=args.mask_close_kernel_size,
         feather_sigma=args.feather_sigma,

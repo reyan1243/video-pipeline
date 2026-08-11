@@ -27,7 +27,7 @@ from transformers import Sam2VideoModel, Sam2VideoProcessor
 
 from detector import SubjectDetector
 from device import autocast, enable_fast_matmul, pick_device
-from mask_ops import is_disrupted, mask_iou
+from mask_ops import downscale_mask, is_disrupted, mask_iou
 from datatypes import (
     BoundingBox,
     SeedFrame,
@@ -206,6 +206,10 @@ class MaskTracker:
                 # safe whatever dtype post_process_masks returns, whereas `mul_`
                 # would mutate the tensor in place if it ever stops being bool.
                 mask = (post_processed[0, 0].to(torch.uint8) * 255).cpu().numpy()
+                # Downscale immediately, so every downstream cost — the IoU
+                # check, the stored dict, cleanup and encoding — is paid at the
+                # reduced size rather than at source resolution.
+                mask = downscale_mask(mask, self.config.max_mask_height)
                 area = int(np.count_nonzero(mask))
                 object_score = (
                     float(output.object_score_logits.item())

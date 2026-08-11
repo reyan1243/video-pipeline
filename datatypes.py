@@ -95,6 +95,11 @@ class TrackerConfig:
     # keyframe; batching amortises that over a window instead of paying it per
     # frame. Larger = fewer seeks, more transient RAM.
     reverse_window: int = 64
+    # Cap mask height, preserving aspect ratio. 0 disables. Tracking is
+    # unaffected — SAM2 resizes every frame to 1024x1024 internally regardless —
+    # so this only shrinks what happens *after* the model: transfer, cleanup,
+    # encode and peak RAM, all of which scale with pixel count.
+    max_mask_height: int = 0
 
 
 @dataclass(frozen=True)

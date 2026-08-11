@@ -53,6 +53,10 @@ _MATTE_ENCODE_ARGS = (
     "-c:v", "libx264",
     "-crf", "18",
     "-tune", "grain",
+    # `grain` disables the psychovisual work that smears sharp edges, which is
+    # also most of what makes slower presets slow — so a fast preset costs very
+    # little here and the matte is a large fraction of total encode time.
+    "-preset", "fast",
     "-pix_fmt", "yuv420p",
     "-movflags", "+faststart",
 )
@@ -69,6 +73,18 @@ _FILL_ENCODE_ARGS = (
 # and therefore alignment with the source — is preserved exactly. ExportResult
 # carries the resulting size so the consumer never has to guess.
 _EVEN_PAD = ("-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2")
+
+
+def _match_frame(mask: np.ndarray, frame_bgr: np.ndarray) -> np.ndarray:
+    """Scale a mask back up to the frame it composites against.
+
+    Only "matte" can ship a reduced-resolution mask; the other two formats write
+    it into real pixels, so a downscaled mask has to be restored first.
+    """
+    height, width = frame_bgr.shape[:2]
+    if mask.shape[0] == height and mask.shape[1] == width:
+        return mask
+    return cv2.resize(mask, (width, height), interpolation=cv2.INTER_LINEAR)
 
 
 class _RawVideoEncoder:
@@ -179,7 +195,14 @@ class LayerExporter:
 
         self._assert_complete_coverage(tracking, metadata)
 
-        width, height = self._padded_size(metadata)
+        # "matte" ships whatever size the masks are (possibly reduced by
+        # max_mask_height); the other formats write into real frames, so their
+        # output is always source-sized and the mask is scaled back up to match.
+        if person_format == "matte":
+            source_width, source_height = self._mask_size(tracking)
+        else:
+            source_width, source_height = metadata.width, metadata.height
+        width, height = source_width + source_width % 2, source_height + source_height % 2
 
         if person_format == "matte":
             matte_path = self._write_matte(tracking, metadata)
@@ -213,8 +236,10 @@ class LayerExporter:
         )
 
     @staticmethod
-    def _padded_size(metadata: VideoMetadata) -> tuple[int, int]:
-        return metadata.width + (metadata.width % 2), metadata.height + (metadata.height % 2)
+    def _mask_size(tracking: TrackingResult) -> tuple[int, int]:
+        first = next(iter(tracking.masks.values()))
+        height, width = first.shape[:2]
+        return width, height
 
     @staticmethod
     def _assert_complete_coverage(tracking: TrackingResult, metadata: VideoMetadata) -> None:
@@ -231,11 +256,12 @@ class LayerExporter:
 
     def _write_matte(self, tracking: TrackingResult, metadata: VideoMetadata) -> Path:
         matte_path = self.output_dir / "person_matte.mp4"
+        mask_width, mask_height = self._mask_size(tracking)
         with _RawVideoEncoder(
             self.ffmpeg_bin,
             matte_path,
-            metadata.width,
-            metadata.height,
+            mask_width,
+            mask_height,
             metadata.fps,
             "gray",
             (*_EVEN_PAD, *_MATTE_ENCODE_ARGS),
@@ -270,7 +296,7 @@ class LayerExporter:
         ) as encoder:
             for frame_idx, frame_bgr in self.video.iter_frames():
                 bgra = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2BGRA)
-                bgra[:, :, 3] = tracking.masks[frame_idx]
+                bgra[:, :, 3] = _match_frame(tracking.masks[frame_idx], frame_bgr)
                 encoder.write(bgra)
         return person_path
 
@@ -296,7 +322,7 @@ class LayerExporter:
             (*_EVEN_PAD, *_MATTE_ENCODE_ARGS),
         ) as matte_encoder:
             for frame_idx, frame_bgr in self.video.iter_frames():
-                mask = tracking.masks[frame_idx]
+                mask = _match_frame(tracking.masks[frame_idx], frame_bgr)
                 fill = frame_bgr.copy()
                 # Documented contract of this format. See the module docstring for
                 # why it costs a dark rim, and prefer "matte" if that matters.

@@ -3,7 +3,18 @@ import unittest
 import numpy as np
 from scipy import ndimage
 
-from mask_ops import clean_mask, clean_masks, feather_mask, is_disrupted, mask_iou, temporal_median
+import cv2
+
+from mask_ops import (
+    clean_mask,
+    clean_masks,
+    downscale_mask,
+    feather_mask,
+    fill_holes,
+    is_disrupted,
+    mask_iou,
+    temporal_median,
+)
 from datatypes import TrackerConfig
 
 
@@ -92,6 +103,90 @@ def _square(size: int = 100, half: int = 20) -> np.ndarray:
     centre = size // 2
     mask[centre - half : centre + half, centre - half : centre + half] = 255
     return mask
+
+
+class TestFillHoles(unittest.TestCase):
+    """fill_holes replaced scipy.ndimage.binary_fill_holes for speed (59ms ->
+    3.6ms per 1080x1920 frame). These pin that it is a true drop-in."""
+
+    def _cases(self):
+        simple = np.zeros((120, 120), np.uint8)
+        simple[20:100, 20:100] = 255
+        simple[50:70, 50:70] = 0  # interior hole
+
+        touching = np.zeros((120, 120), np.uint8)
+        touching[0:60, 0:60] = 255  # subject touching the (0,0) corner
+        touching[20:30, 20:30] = 0
+
+        two_blobs = np.zeros((120, 120), np.uint8)
+        two_blobs[10:50, 10:50] = 255
+        two_blobs[70:110, 70:110] = 255
+        two_blobs[20:30, 20:30] = 0
+
+        notched = np.zeros((120, 120), np.uint8)
+        notched[20:100, 20:100] = 255
+        notched[50:70, 20:60] = 0  # open notch — NOT a hole, must stay open
+
+        return {
+            "simple": simple,
+            "corner_touching": touching,
+            "two_blobs": two_blobs,
+            "open_notch": notched,
+            "empty": np.zeros((40, 40), np.uint8),
+            "full": np.full((40, 40), 255, np.uint8),
+        }
+
+    def test_matches_scipy_exactly(self):
+        for name, mask in self._cases().items():
+            with self.subTest(case=name):
+                expected = ndimage.binary_fill_holes(mask > 0).astype(np.uint8) * 255
+                np.testing.assert_array_equal(fill_holes(mask), expected)
+
+    def test_fills_an_interior_hole(self):
+        mask = self._cases()["simple"]
+        self.assertEqual(mask[60, 60], 0)
+        self.assertEqual(fill_holes(mask)[60, 60], 255)
+
+    def test_leaves_an_open_notch_open(self):
+        # A notch reaching the background is not enclosed, so filling it would
+        # swallow negative space a caption is meant to show through.
+        filled = fill_holes(self._cases()["open_notch"])
+        self.assertEqual(filled[60, 30], 0)
+
+    def test_survives_subject_touching_the_corner(self):
+        # Flooding from the raw (0,0) pixel would fail here; the 1px zero border
+        # is what makes the seed provably background.
+        filled = fill_holes(self._cases()["corner_touching"])
+        self.assertEqual(filled[25, 25], 255)
+        self.assertEqual(filled[100, 100], 0)
+
+    def test_preserves_shape_and_dtype(self):
+        mask = self._cases()["simple"]
+        out = fill_holes(mask)
+        self.assertEqual(out.shape, mask.shape)
+        self.assertEqual(out.dtype, np.uint8)
+
+
+class TestDownscaleMask(unittest.TestCase):
+    def test_caps_height_and_preserves_aspect(self):
+        mask = np.zeros((1920, 1080), np.uint8)
+        out = downscale_mask(mask, 960)
+        self.assertEqual(out.shape, (960, 540))
+
+    def test_no_op_when_already_small_enough(self):
+        mask = np.zeros((480, 270), np.uint8)
+        self.assertIs(downscale_mask(mask, 960), mask)
+
+    def test_zero_disables(self):
+        mask = np.zeros((1920, 1080), np.uint8)
+        self.assertIs(downscale_mask(mask, 0), mask)
+
+    def test_keeps_the_silhouette(self):
+        mask = np.zeros((1920, 1080), np.uint8)
+        cv2.circle(mask, (540, 960), 300, 255, -1)
+        out = downscale_mask(mask, 960)
+        self.assertEqual(int(out[480, 270]), 255)  # centre still solid
+        self.assertEqual(int(out[10, 10]), 0)  # corner still empty
 
 
 class TestFeatherMask(unittest.TestCase):
