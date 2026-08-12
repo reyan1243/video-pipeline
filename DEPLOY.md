@@ -27,7 +27,7 @@ source video the browser already has.
 RunPod builds the image itself — no Docker, no multi-GB upload from your laptop.
 
 Console → **Settings → Connections → GitHub → Connect** → grant access to
-`kalakar-es/video-pipeline`. Private repos work.
+`reyan1243/video-pipeline`. Private repos work.
 
 > Only one GitHub account can be connected per RunPod account, and it is not
 > shared with teammates.
@@ -47,7 +47,7 @@ six-tile flow shipped 2026-07-01.)*
 
 | Field | Value |
 |---|---|
-| Repository | `kalakar-es/video-pipeline` |
+| Repository | `reyan1243/video-pipeline` |
 | Branch | `perf/cost-and-matte-quality` |
 | **Dockerfile Path** | **`Dockerfile.serverless`** |
 
@@ -63,7 +63,7 @@ Six of these differ from the defaults. Each one is a real failure otherwise.
 | Field | Value | Why |
 |---|---|---|
 | Endpoint type | **Queue** | Load-balancing endpoints cap at ~5.5 min of processing; our jobs run 2–5 min |
-| GPU | **RTX 4090** → L40S → A6000 | Measured: a faster GPU costs the *same per job* (price scales with speed), so this is about availability, not speed. Three types = three pools to draw from. |
+| GPU priority | **RTX 4090 PRO** → A6000/A40 → L40S | **Availability**, not cost. Below five workers every worker uses the highest-priority type available, so this is pure fallback, not distribution. Listed cheapest-first because per-second rates differ materially: 4090 PRO $0.00031, A6000/A40 $0.00034, L40S $0.00053. A dearer card only breaks even if it is proportionally faster, which is unproven — do not assume it is free to fall back. |
 | Active workers | **0** | Scale to zero. A single always-on worker is ~$790/mo. |
 | Max workers | **3** | Queue capacity is `max_workers × 100` |
 | GPUs per worker | **1** | Tracking is sequential; a second GPU idles |
@@ -72,6 +72,8 @@ Six of these differ from the defaults. Each one is a real failure otherwise.
 | Job TTL | **86400 s** | Clock starts at *submission* and includes queue time |
 | **Container disk** | **50 GB** *(default 20)* | Ephemeral scratch; the image alone is ~9 GB |
 | FlashBoot | **on** | Free. Snapshots the warmed worker → ~7s restarts instead of ~70s |
+| **CUDA version** | **12.4 and all newer** | The image ships cu124 wheels. Landing on an older driver reproduces `NVIDIA driver too old (found version 12040)` — the exact failure this repo was debugged through. CUDA is forward-compatible, so a wider selection means more available hardware. |
+| Auto-scaling | **Request count**, value `1` | Default is queue-delay at 4s. Request count fans a burst out immediately rather than trickling. |
 | Data centers | **all** | Restricting shrinks the GPU pool |
 | Network volume | **none** | Pins the endpoint to one datacenter |
 
@@ -278,6 +280,23 @@ the same reason.
 
 ---
 
+## 8b. Idle endpoints scale themselves to zero — permanently
+
+Undocumented in most write-ups and easy to lose a day to:
+
+* **3 days** with no requests → max workers drops to **2** (RunPod emails you)
+* **7 days** with no requests → max workers drops to **0**
+
+It **stays there** until you raise it by hand. A staging endpoint left alone over
+a holiday comes back with `max_workers = 0`, and jobs then queue forever with no
+error — the submit succeeds, `/status` just never leaves `IN_QUEUE`.
+
+Either send a weekly synthetic job, or check max workers before trusting a
+staging endpoint that has been quiet.
+
+Related: scaling is capped by account balance — roughly $100+ to allow 10
+workers. If the balance is low, raising max workers may silently not take.
+
 ## 9. Things that will bite you
 
 1. **Blank Dockerfile Path** builds the old FastAPI image.
@@ -288,3 +307,6 @@ the same reason.
 6. **Cold start is billed.** Docs are authoritative; several vendor blogs claim otherwise.
 7. **Updates need a GitHub release**, not a push. RunPod's launch blog says otherwise and is stale.
 8. **Container disk is ephemeral** and wiped on restart.
+9. **An idle endpoint scales its own max workers to 0 after 7 days** and stays there — see §8b.
+10. **CUDA selection left unset** can land the cu124 image on an older driver.
+11. **Async results are retained only 30 minutes.** A 404 from `/status` is terminal — the job was deleted, not delayed. `settleJob` already treats it that way.
