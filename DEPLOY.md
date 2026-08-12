@@ -100,6 +100,15 @@ the resident models away and force a reload on the next job.
 
 ## 4. Environment variables
 
+**The worker does not need storage credentials in production.** Your projects
+carry their own `storage_provider` (R2/S3/B2) and R2 uploads can fail over to
+S3, so the destination is the API's decision, not the worker's. The API presigns
+a PUT and passes it as `upload_url`; the worker writes that one object and can
+reach nothing else in any bucket.
+
+The variables below are the **standalone fallback**, used only when no
+`upload_url` is supplied — i.e. local testing.
+
 | Variable | Value |
 |---|---|
 | `S3_BUCKET` | your R2 bucket |
@@ -190,6 +199,8 @@ from a crash — so caller-actionable problems come back as `ok: false` instead.
 | `code` | Meaning |
 |---|---|
 | `missing_input` | no `video_url` |
+| `invalid_range` | `start_time` negative, or `end_time` <= `start_time` |
+| `source_unavailable` | the URL 4xx'd or was unreachable. **A 401/403 usually means the presigned URL expired while the job sat in the queue** — sign it for longer than the job TTL. |
 | `too_long` | over `MAX_DURATION_SECONDS` — pass `start_time`/`end_time` |
 | `too_large` | over the mask-RAM guard — downscale or shorten |
 | `incomplete_coverage` | subject lost — better prompt, or split the clip |
@@ -212,7 +223,10 @@ cancel early when a user abandons.
 
 | Field | Default | Notes |
 |---|---|---|
-| `video_url` | — | **required**, must be fetchable by the worker |
+| `video_url` | — | **required**, presigned GET. Redirects are refused. |
+| `upload_url` | — | presigned PUT for the matte. Supply this and the worker needs no credentials. |
+| `matte_key` | — | the key `upload_url` points at; echoed back for the job row |
+| `upload_content_type` | `video/mp4` | must match what `upload_url` was signed with |
 | `prompt` | `"person"` | open-vocabulary: `"dog"`, `"woman in red jacket"` |
 | `start_time` / `end_time` | whole clip | **the cost lever** — you pay per GPU-second |
 | `num_seed_candidates` | `12` | stops early at IoU ≥ 0.97; usually costs 1 |

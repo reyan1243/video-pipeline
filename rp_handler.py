@@ -45,6 +45,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import replace
 from pathlib import Path
@@ -166,7 +167,7 @@ def _download(url: str, dest: Path) -> str:
     """Stream to disk, enforcing the size cap, returning the sha256."""
     request = urllib.request.Request(url, headers={"User-Agent": "video-pipeline-worker"})
     digest = hashlib.sha256()
-    with urllib.request.urlopen(request, timeout=120) as response:
+    with _OPENER.open(request, timeout=120) as response:
         declared = response.headers.get("Content-Length")
         if declared and int(declared) > MAX_DOWNLOAD_BYTES:
             raise ValueError(f"video exceeds the {MAX_DOWNLOAD_BYTES} byte limit")
@@ -185,6 +186,50 @@ def _download(url: str, dest: Path) -> str:
     return digest.hexdigest()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects on the source fetch.
+
+    The worker is handed a URL by our backend and fetches it with no further
+    checks, so a redirect is the one way that URL could point somewhere it was
+    never signed for — including an address inside the worker's own network.
+    Presigned R2 URLs never redirect, so refusing costs nothing. Mirrors the
+    `maxRedirects: 0` already used on untrusted fetches in apps/api.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(newurl, code, f"redirect refused ({code})", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _remote_identity(url: str) -> str | None:
+    """Identify the source object without downloading it.
+
+    Uses a one-byte ranged GET rather than HEAD: a presigned URL is signed for a
+    specific method, so HEAD against a `get_object` presign fails signature
+    validation. A Range request is still a GET, so the signature holds, and the
+    response carries ETag and the total size in Content-Range.
+
+    Returns None whenever the origin does not cooperate — the caller then falls
+    back to hashing the downloaded bytes.
+    """
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "video-pipeline-worker", "Range": "bytes=0-0"}
+    )
+    try:
+        with _OPENER.open(request, timeout=30) as response:
+            etag = (response.headers.get("ETag") or "").strip().strip('"')
+            content_range = response.headers.get("Content-Range") or ""
+    except Exception:  # noqa: BLE001 — any failure just means "cannot identify"
+        return None
+
+    if not etag:
+        return None
+    total = content_range.rsplit("/", 1)[-1] if "/" in content_range else ""
+    return f"{etag}:{total}"
+
+
 def _probe(path: Path) -> dict:
     result = subprocess.run(
         [
@@ -198,7 +243,13 @@ def _probe(path: Path) -> dict:
         capture_output=True, text=True, check=True,
     )
     parsed = json.loads(result.stdout)
-    stream = parsed["streams"][0]
+    streams = parsed.get("streams") or []
+    if not streams:
+        raise ValueError(
+            "no video stream found — the URL points at audio, an image, or a file "
+            "that is not a video"
+        )
+    stream = streams[0]
     return {
         "width": int(stream["width"]),
         "height": int(stream["height"]),
@@ -281,6 +332,33 @@ def _rejected(code: str, reason: str, **extra) -> dict:
     return {"ok": False, "code": code, "reason": reason, **extra}
 
 
+def _put_presigned(local: Path, url: str, content_type: str = "video/mp4") -> None:
+    """Upload via a presigned PUT supplied by the caller.
+
+    This is the preferred path, and it exists because the destination is not the
+    worker's to choose. Projects carry their own `storage_provider` (R2, S3 or
+    B2) and R2 uploads can fail over to S3, so a bucket hardcoded here would
+    scatter mattes away from the projects they belong to.
+
+    Letting the API sign the destination also means the worker holds no storage
+    credentials whatsoever — it can write exactly one object, the one it was
+    asked to produce, and nothing else in any bucket.
+
+    The Content-Type must match whatever the URL was signed with, or the origin
+    rejects the signature.
+    """
+    payload = local.read_bytes()
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="PUT",
+        headers={"Content-Type": content_type, "Content-Length": str(len(payload))},
+    )
+    with _OPENER.open(request, timeout=300) as response:
+        if response.status not in (200, 201, 204):
+            raise RuntimeError(f"upload rejected with HTTP {response.status}")
+
+
 def _cleanup(workdir: Path) -> None:
     shutil.rmtree(workdir, ignore_errors=True)
     gc.collect()
@@ -311,10 +389,24 @@ def _handle(job):
     feather_sigma = float(job_input.get("feather_sigma", DEFAULT_FEATHER_SIGMA))
     smoothing = bool(job_input.get("temporal_smoothing", False))
     max_mask_height = int(job_input.get("max_mask_height", MAX_MASK_HEIGHT))
+    # Where the matte goes. When the caller supplies a presigned PUT we use it
+    # and touch no credentials; the env-configured bucket is the standalone
+    # fallback for local testing.
+    upload_url = job_input.get("upload_url")
+    upload_key = job_input.get("matte_key")
+    upload_content_type = str(job_input.get("upload_content_type", "video/mp4"))
+
     start_time = job_input.get("start_time")
     end_time = job_input.get("end_time")
     start_time = float(start_time) if start_time is not None else None
     end_time = float(end_time) if end_time is not None else None
+
+    if start_time is not None and start_time < 0:
+        return _rejected("invalid_range", "start_time cannot be negative")
+    if end_time is not None and start_time is not None and end_time <= start_time:
+        return _rejected(
+            "invalid_range", f"end_time ({end_time}) must be after start_time ({start_time})"
+        )
 
     params = {
         "prompt": prompt,
@@ -333,10 +425,14 @@ def _handle(job):
 
     try:
         source = workdir / "input.mp4"
-        content_hash = _download(video_url, source)
 
-        key = _output_key(content_hash, params)
-        if _already_done(key):
+        # Identify the source before fetching it. A cache hit then costs one
+        # ranged request instead of a full download — tens of seconds of billed
+        # transfer on a 67 MB clip, for a result we already hold.
+        identity = _remote_identity(video_url)
+        key = _output_key(identity, params) if identity else None
+
+        if key is not None and _already_done(key):
             # Same bytes, same settings — a duplicate submission or a requeue after
             # a heartbeat lapse. Returning the existing object costs nothing.
             return {
@@ -347,6 +443,21 @@ def _handle(job):
                 "processing_seconds": round(time.time() - started, 1),
                 "url_expires_in_seconds": URL_TTL_SECONDS,
             }
+
+        content_hash = _download(video_url, source)
+        if key is None:
+            # The origin gave us nothing to identify it by, so fall back to
+            # hashing the bytes: same guarantee, just paid for after the fact.
+            key = _output_key(content_hash, params)
+            if _already_done(key):
+                return {
+                    "ok": True,
+                    "matte_key": key,
+                    "matte_url": _presign(key),
+                    "cached": True,
+                    "processing_seconds": round(time.time() - started, 1),
+                    "url_expires_in_seconds": URL_TTL_SECONDS,
+                }
 
         clip = _trim(source, workdir / "clip.mp4", start_time, end_time)
 
@@ -409,13 +520,22 @@ def _handle(job):
         export = exporter.export(tracking, metadata, person_format="matte")
 
         runpod.serverless.progress_update(job, "uploading")
+
+        if upload_url:
+            _put_presigned(Path(export.matte_path), upload_url, upload_content_type)
+            # The caller chose the key and owns the bucket, so it can presign a
+            # GET itself — we have no credentials to do so and should not.
+            stored_key, stored_url = upload_key, None
+        else:
+            stored_key, stored_url = key, _upload(Path(export.matte_path), key)
+
         return {
             "ok": True,
             # The key is the durable reference — store this. The URL is a
             # convenience for testing and expires after URL_TTL_SECONDS; callers
             # should re-presign from the key rather than persist the URL.
-            "matte_key": key,
-            "matte_url": _upload(Path(export.matte_path), key),
+            "matte_key": stored_key,
+            "matte_url": stored_url,
             "cached": False,
             "frames": metadata.frame_count,
             "fps": metadata.fps,
@@ -429,6 +549,16 @@ def _handle(job):
             "url_expires_in_seconds": URL_TTL_SECONDS,
         }
 
+    except urllib.error.HTTPError as exc:
+        hint = (
+            " The presigned URL may have expired while the job sat in the queue — "
+            "sign it for longer than the job's TTL."
+            if exc.code in (401, 403)
+            else ""
+        )
+        return _rejected("source_unavailable", f"could not fetch the video: HTTP {exc.code}.{hint}")
+    except urllib.error.URLError as exc:
+        return _rejected("source_unavailable", f"could not reach the video URL: {exc.reason}")
     except ValueError as exc:
         # Guard rejections (oversize download, unusable fps, no detection) — all
         # caller-actionable, so COMPLETED with ok=False rather than FAILED.
