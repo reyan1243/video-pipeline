@@ -99,9 +99,15 @@ class MaskTracker:
         # it rather than trusting the arithmetic. Reset here so the figure covers
         # tracking only, not the weights loaded long before.
         self.peak_bytes = 0
+        self.baseline_bytes = 0
         self.longest_segment = 0
         if self.device == "cuda":
+            # reset_peak_memory_stats() rebases the peak to *current* allocation,
+            # not zero, so the weights already resident are counted in every
+            # subsequent reading. Record them separately or the per-frame figure
+            # is inflated by a constant.
             torch.cuda.reset_peak_memory_stats()
+            self.baseline_bytes = torch.cuda.memory_allocated()
 
         frame_bytes = max(1, metadata.width * metadata.height * 3)
         window = max(1, min(self.config.reverse_window, REVERSE_BUFFER_BUDGET_BYTES // frame_bytes))
