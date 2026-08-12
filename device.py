@@ -58,3 +58,20 @@ def autocast(device: str):
     if _AUTOCAST_DISABLED or device != "cuda":
         return contextlib.nullcontext()
     return torch.autocast("cuda", dtype=torch.bfloat16)
+
+
+def weights_dtype(device: str, prefer_bfloat16: bool):
+    """Dtype to load model weights in.
+
+    bfloat16 halves the ~2.7 GB of weights this pipeline reads from disk and
+    uploads to the GPU, which is the whole of the pre-run startup cost — billed
+    on every serverless cold start. Activations already run in bf16 under
+    `autocast`, and SAM2's reference implementation runs bf16 throughout, so the
+    numerics are the ones the model was designed around.
+
+    Off by default regardless: it is a real change to what is loaded, and unlike
+    autocast it is not required for correctness.
+    """
+    if not prefer_bfloat16 or device != "cuda":
+        return None
+    return torch.bfloat16

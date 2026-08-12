@@ -26,7 +26,7 @@ from PIL import Image
 from transformers import Sam2VideoModel, Sam2VideoProcessor
 
 from detector import SubjectDetector
-from device import autocast, enable_fast_matmul, pick_device
+from device import autocast, enable_fast_matmul, pick_device, weights_dtype
 from mask_ops import downscale_mask, is_disrupted, mask_iou
 from datatypes import (
     BoundingBox,
@@ -82,6 +82,7 @@ class MaskTracker:
         config: TrackerConfig = TrackerConfig(),
         device: str | None = None,
         model_id: str | None = None,
+        prefer_bfloat16: bool = False,
     ):
         self.video = video
         self.detector = detector
@@ -91,7 +92,13 @@ class MaskTracker:
         enable_fast_matmul()
 
         self.processor = Sam2VideoProcessor.from_pretrained(self.model_id)
-        self.model = Sam2VideoModel.from_pretrained(self.model_id).to(self.device).eval()
+        self.model = (
+            Sam2VideoModel.from_pretrained(
+                self.model_id, torch_dtype=weights_dtype(self.device, prefer_bfloat16)
+            )
+            .to(self.device)
+            .eval()
+        )
 
     def track(self, seed: SeedFrame, metadata: VideoMetadata) -> TrackingResult:
         frame_bytes = max(1, metadata.width * metadata.height * 3)

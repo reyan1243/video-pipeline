@@ -93,6 +93,9 @@ MAX_SEGMENT_FRAMES = int(os.environ.get("MAX_SEGMENT_FRAMES", 600))
 # quartering mask cleanup, encoding and RAM — which together outweigh tracking.
 MAX_MASK_HEIGHT = int(os.environ.get("MAX_MASK_HEIGHT", 0))
 MODEL_SIZE = os.environ.get("MODEL_SIZE", "large")
+# bfloat16 weights halve the ~2.7GB that moves disk -> GPU at worker start.
+# RunPod bills that start time, so this is a direct cold-start saving.
+BF16_WEIGHTS = os.environ.get("BF16_WEIGHTS", "").strip().lower() in {"1", "true", "yes"}
 
 MODEL_IDS = {
     "large": "facebook/sam2.1-hiera-large",
@@ -115,14 +118,17 @@ _TRACKER_CONFIG = TrackerConfig(
     max_mask_height=MAX_MASK_HEIGHT,
 )
 
-_detector = SubjectDetector(prompt="person", device=DEVICE)
-_segmenter = SeedSegmenter(_detector, device=DEVICE, model_id=_MODEL_ID)
+_detector = SubjectDetector(prompt="person", device=DEVICE, prefer_bfloat16=BF16_WEIGHTS)
+_segmenter = SeedSegmenter(
+    _detector, device=DEVICE, model_id=_MODEL_ID, prefer_bfloat16=BF16_WEIGHTS
+)
 _tracker = MaskTracker(
     video=None,  # replaced per request
     detector=_detector,
     config=_TRACKER_CONFIG,
     device=DEVICE,
     model_id=_MODEL_ID,
+    prefer_bfloat16=BF16_WEIGHTS,
 )
 
 print(

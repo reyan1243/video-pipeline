@@ -51,31 +51,48 @@ class VideoLayerPipeline:
         device: str | None = None,
         model_size: str = "large",
         release_seed_model: bool = True,
+        prefer_bfloat16: bool = False,
         verbose: bool = False,
     ):
         if model_size not in MODEL_IDS:
             raise ValueError(f"unknown model_size {model_size!r} — expected one of {sorted(MODEL_IDS)}")
         model_id = MODEL_IDS[model_size]
 
+        self.verbose = verbose
         self.video = VideoSource(video_path)
-        self.detector = SubjectDetector(prompt=prompt, device=device)
+
+        # ~2.7 GB of weights move disk -> GPU here, and it used to happen in
+        # total silence before run() printed anything, which reads as a hang.
+        # Note sam2 is loaded TWICE: once as Sam2Model to score seed frames,
+        # once as Sam2VideoModel to track. Same checkpoint, two objects.
+        loaded_at = time.time()
+        self._log("loading grounding-dino")
+        self.detector = SubjectDetector(prompt=prompt, device=device, prefer_bfloat16=prefer_bfloat16)
+        self._log(f"loading {model_id} (image)")
         self.segmenter = SeedSegmenter(
-            self.detector, num_candidates=num_seed_candidates, device=device, model_id=model_id
+            self.detector,
+            num_candidates=num_seed_candidates,
+            device=device,
+            model_id=model_id,
+            prefer_bfloat16=prefer_bfloat16,
         )
+        self._log(f"loading {model_id} (video)")
         self.tracker = MaskTracker(
             self.video,
             self.detector,
             config=tracker_config or TrackerConfig(),
             device=device,
             model_id=model_id,
+            prefer_bfloat16=prefer_bfloat16,
         )
+        self._log(f"models ready in {time.time() - loaded_at:.1f}s")
+
         self.exporter = LayerExporter(self.video, output_dir=output_dir)
         self.mask_close_kernel_size = mask_close_kernel_size
         self.feather_sigma = feather_sigma
         self.temporal_smoothing = temporal_smoothing
         self.person_format = person_format
         self.release_seed_model = release_seed_model
-        self.verbose = verbose
 
     def _log(self, message: str) -> None:
         # A long run used to print nothing at all until it finished, which makes
@@ -170,6 +187,12 @@ def main(argv: list[str] | None = None) -> None:
         "quarters cleanup, encode and RAM",
     )
     tracking.add_argument(
+        "--bf16-weights",
+        action="store_true",
+        help="load weights in bfloat16 on CUDA — roughly halves the ~2.7GB startup "
+        "load and the VRAM they occupy; activations already run bf16 under autocast",
+    )
+    tracking.add_argument(
         "--model-size",
         choices=sorted(MODEL_IDS),
         default="large",
@@ -194,6 +217,7 @@ def main(argv: list[str] | None = None) -> None:
         temporal_smoothing=args.temporal_smoothing,
         person_format=args.person_format,
         model_size=args.model_size,
+        prefer_bfloat16=args.bf16_weights,
         verbose=True,
     )
     result = pipeline.run()
