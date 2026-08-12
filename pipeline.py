@@ -12,6 +12,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+# Importing torch + transformers takes tens of seconds on a cold container
+# filesystem, and it happens below, before any of our code can run. Announce it
+# first or the CLI looks hung for its slowest single step. Guarded so importing
+# this module as a library stays silent.
+if __name__ == "__main__":
+    print(
+        f"[{time.strftime('%H:%M:%S')}] importing torch + transformers "
+        "(slow on a cold container, cached afterwards)",
+        file=sys.stderr,
+        flush=True,
+    )
+
 from detector import SubjectDetector
 from exporter import LayerExporter, PersonFormat
 from mask_ops import DEFAULT_CLOSE_KERNEL_SIZE, DEFAULT_FEATHER_SIGMA, clean_masks, temporal_median

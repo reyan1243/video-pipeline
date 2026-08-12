@@ -11,7 +11,7 @@ import torch
 from PIL import Image
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
-from device import autocast, enable_fast_matmul, pick_device, weights_dtype
+from device import autocast, enable_fast_matmul, load_pretrained, pick_device
 from datatypes import BoundingBox
 
 
@@ -44,13 +44,7 @@ class SubjectDetector:
         enable_fast_matmul()
 
         self.processor = AutoProcessor.from_pretrained(self.MODEL_ID)
-        self.model = (
-            AutoModelForZeroShotObjectDetection.from_pretrained(
-                self.MODEL_ID, torch_dtype=weights_dtype(self.device, prefer_bfloat16)
-            )
-            .to(self.device)
-            .eval()
-        )
+        self.model = load_pretrained(AutoModelForZeroShotObjectDetection, self.MODEL_ID, self.device, prefer_bfloat16)
 
     def detect(self, frame_rgb: Image.Image) -> BoundingBox | None:
         inputs = self.processor(images=frame_rgb, text=self.prompt, return_tensors="pt").to(self.device)

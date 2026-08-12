@@ -75,3 +75,21 @@ def weights_dtype(device: str, prefer_bfloat16: bool):
     if not prefer_bfloat16 or device != "cuda":
         return None
     return torch.bfloat16
+
+
+def load_pretrained(model_cls, model_id: str, device: str, prefer_bfloat16: bool):
+    """`from_pretrained(...).to(device).eval()` with the dtype kwarg sorted out.
+
+    transformers renamed `torch_dtype` to `dtype` and warns loudly on the old
+    name, but the repo supports >=4.56 where only the old name exists. Try the
+    new one, fall back on TypeError.
+    """
+    dtype = weights_dtype(device, prefer_bfloat16)
+    if dtype is None:
+        model = model_cls.from_pretrained(model_id)
+    else:
+        try:
+            model = model_cls.from_pretrained(model_id, dtype=dtype)
+        except TypeError:
+            model = model_cls.from_pretrained(model_id, torch_dtype=dtype)
+    return model.to(device).eval()

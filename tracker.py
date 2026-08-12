@@ -26,7 +26,7 @@ from PIL import Image
 from transformers import Sam2VideoModel, Sam2VideoProcessor
 
 from detector import SubjectDetector
-from device import autocast, enable_fast_matmul, pick_device, weights_dtype
+from device import autocast, enable_fast_matmul, load_pretrained, pick_device
 from mask_ops import downscale_mask, is_disrupted, mask_iou
 from datatypes import (
     BoundingBox,
@@ -92,13 +92,7 @@ class MaskTracker:
         enable_fast_matmul()
 
         self.processor = Sam2VideoProcessor.from_pretrained(self.model_id)
-        self.model = (
-            Sam2VideoModel.from_pretrained(
-                self.model_id, torch_dtype=weights_dtype(self.device, prefer_bfloat16)
-            )
-            .to(self.device)
-            .eval()
-        )
+        self.model = load_pretrained(Sam2VideoModel, self.model_id, self.device, prefer_bfloat16)
 
     def track(self, seed: SeedFrame, metadata: VideoMetadata) -> TrackingResult:
         # Peak VRAM is the constraint that decides max_segment_frames, so measure

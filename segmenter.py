@@ -16,7 +16,7 @@ from PIL import Image
 from transformers import Sam2Model, Sam2Processor
 
 from detector import SubjectDetector
-from device import autocast, enable_fast_matmul, pick_device, weights_dtype
+from device import autocast, enable_fast_matmul, load_pretrained, pick_device
 from datatypes import BoundingBox, SeedFrame, VideoMetadata
 from video_source import VideoSource
 
@@ -45,13 +45,7 @@ class SeedSegmenter:
         enable_fast_matmul()
 
         self.processor = Sam2Processor.from_pretrained(self.model_id)
-        self.model = (
-            Sam2Model.from_pretrained(
-                self.model_id, torch_dtype=weights_dtype(self.device, prefer_bfloat16)
-            )
-            .to(self.device)
-            .eval()
-        )
+        self.model = load_pretrained(Sam2Model, self.model_id, self.device, prefer_bfloat16)
 
     def segment(self, frame_rgb: Image.Image, box: BoundingBox) -> tuple[np.ndarray, float]:
         inputs = self.processor(
