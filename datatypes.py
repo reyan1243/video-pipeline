@@ -36,6 +36,12 @@ class VideoMetadata:
     width: int
     height: int
     frame_count: int  # empirically-read count — never cv2.CAP_PROP_FRAME_COUNT, which over-reports
+    # Exact frame rate as a rational string (e.g. "30000/1001"), from ffprobe.
+    # `fps` above is a float and OpenCV's CAP_PROP_FPS is measurably wrong on
+    # some files — it reports 29.991793 for a 30000/1001 clip, which encodes the
+    # matte 0.07% fast and drifts it a full frame out of step by 46s. Encoders
+    # must use this when present.
+    fps_rational: str = ""
 
     @property
     def last_frame_index(self) -> int:

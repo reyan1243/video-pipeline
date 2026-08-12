@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import subprocess
 from contextlib import contextmanager
+from fractions import Fraction
 from pathlib import Path
 from typing import Iterator
 
@@ -22,6 +24,30 @@ def _open_capture(path: Path) -> Iterator[cv2.VideoCapture]:
         yield capture
     finally:
         capture.release()
+
+
+def _probe_frame_rate(path: Path) -> Fraction | None:
+    """Exact frame rate from the container, as a rational.
+
+    OpenCV's CAP_PROP_FPS is a float and is measurably wrong on real files —
+    29.991793 for a clip whose true rate is 30000/1001 (29.970030). Encoding the
+    matte at that value makes it run 0.07% fast, which is a full frame of drift
+    against the source by the 46-second mark. Nothing downstream can recover it,
+    so read the real value here.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        rate = Fraction(result.stdout.strip())
+    except (ValueError, ZeroDivisionError):
+        return None
+    return rate if rate > 0 else None
 
 
 class VideoSource:
@@ -52,6 +78,11 @@ class VideoSource:
 
         if read_count == 0:
             raise ValueError(f"no decodable frames in {self.path}")
+
+        exact = _probe_frame_rate(self.path)
+        fps_rational = ""
+        if exact is not None:
+            fps, fps_rational = float(exact), f"{exact.numerator}/{exact.denominator}"
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError(
                 f"{self.path} reports an unusable frame rate ({fps!r}). Re-encode to a "
@@ -59,7 +90,10 @@ class VideoSource:
                 "guessing here would silently desync the matte from the source."
             )
 
-        return VideoMetadata(path=self.path, fps=fps, width=width, height=height, frame_count=read_count)
+        return VideoMetadata(
+            path=self.path, fps=fps, width=width, height=height,
+            frame_count=read_count, fps_rational=fps_rational,
+        )
 
     def iter_frames(self) -> Iterator[tuple[int, np.ndarray]]:
         with _open_capture(self.path) as capture:

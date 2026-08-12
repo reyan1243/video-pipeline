@@ -262,7 +262,7 @@ class LayerExporter:
             matte_path,
             mask_width,
             mask_height,
-            metadata.fps,
+            metadata.fps_rational or metadata.fps,
             "gray",
             (*_EVEN_PAD, *_MATTE_ENCODE_ARGS),
         ) as encoder:
@@ -277,7 +277,7 @@ class LayerExporter:
             person_path,
             metadata.width,
             metadata.height,
-            metadata.fps,
+            metadata.fps_rational or metadata.fps,
             "bgra",
             (
                 "-c:v", "libvpx-vp9",
@@ -309,7 +309,7 @@ class LayerExporter:
             fill_path,
             metadata.width,
             metadata.height,
-            metadata.fps,
+            metadata.fps_rational or metadata.fps,
             "bgr24",
             (*_EVEN_PAD, *_FILL_ENCODE_ARGS),
         ) as fill_encoder, _RawVideoEncoder(
@@ -317,7 +317,7 @@ class LayerExporter:
             matte_path,
             metadata.width,
             metadata.height,
-            metadata.fps,
+            metadata.fps_rational or metadata.fps,
             "gray",
             (*_EVEN_PAD, *_MATTE_ENCODE_ARGS),
         ) as matte_encoder:
