@@ -43,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from dataclasses import replace
@@ -132,9 +133,17 @@ _tracker = MaskTracker(
 )
 
 print(
-    f"[cold start] {_MODEL_ID} loaded in {time.time() - _t0:.1f}s on {DEVICE}",
+    f"[cold start] {_MODEL_ID} on {DEVICE} in {time.time() - _t0:.1f}s "
+    f"(bf16_weights={BF16_WEIGHTS}, max_mask_height={MAX_MASK_HEIGHT or 'source'}). "
+    "This is paid once per worker, not per job.",
     flush=True,
 )
+
+# The stages are module-level singletons whose per-request fields are mutated,
+# so two jobs on one worker would corrupt each other. RunPod sends one job per
+# worker by default (no concurrency_modifier is set), making this belt-and-braces
+# — but the failure it prevents is silent wrong output, not a crash.
+_JOB_LOCK = threading.Lock()
 
 _s3 = None
 if S3_BUCKET:
@@ -285,6 +294,11 @@ def _cleanup(workdir: Path) -> None:
 
 
 def handler(job):
+    with _JOB_LOCK:
+        return _handle(job)
+
+
+def _handle(job):
     job_input = job.get("input") or {}
 
     video_url = job_input.get("video_url")
