@@ -101,6 +101,14 @@ class MaskTracker:
         )
 
     def track(self, seed: SeedFrame, metadata: VideoMetadata) -> TrackingResult:
+        # Peak VRAM is the constraint that decides max_segment_frames, so measure
+        # it rather than trusting the arithmetic. Reset here so the figure covers
+        # tracking only, not the weights loaded long before.
+        self.peak_bytes = 0
+        self.longest_segment = 0
+        if self.device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+
         frame_bytes = max(1, metadata.width * metadata.height * 3)
         window = max(1, min(self.config.reverse_window, REVERSE_BUFFER_BUDGET_BYTES // frame_bytes))
 
@@ -111,6 +119,9 @@ class MaskTracker:
         # Backward wins on the shared seed frame. Both directions prompt from the
         # same box on the same frame, so the two masks agree; the ordering is
         # incidental and kept as-is to avoid changing established behaviour.
+        if self.device == "cuda":
+            self.peak_bytes = torch.cuda.max_memory_allocated()
+
         masks = {**forward.masks, **backward.masks}
         diagnostics = forward.diagnostics + backward.diagnostics
         return TrackingResult(masks=masks, diagnostics=diagnostics)
@@ -251,6 +262,7 @@ class MaskTracker:
                     reason = "capped"
                     break
 
+        self.longest_segment = max(getattr(self, "longest_segment", 0), len(masks))
         return _SegmentOutcome(
             masks=masks, diagnostics=diagnostics, reason=reason, last_mask=prev_mask
         )

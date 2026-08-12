@@ -116,7 +116,16 @@ class VideoLayerPipeline:
 
         self._log("tracking")
         tracking = self.tracker.track(seed, metadata)
+        peak = getattr(self.tracker, "peak_bytes", 0)
+        longest = getattr(self.tracker, "longest_segment", 0) or 1
         self._log(f"tracked {len(tracking.masks)}/{metadata.frame_count} frames")
+        if peak:
+            # Reported per frame of the LONGEST segment, since that is what sets
+            # the ceiling — a session's state is freed when the segment ends.
+            self._log(
+                f"peak VRAM {peak / 1024**3:.2f} GiB over a {longest}-frame segment "
+                f"({peak / 1024**2 / longest:.1f} MiB/frame)"
+            )
 
         self._log("cleaning masks")
         clean_masks(tracking.masks, self.mask_close_kernel_size, self.feather_sigma)
