@@ -1,7 +1,18 @@
-.venv/
-data/
-smoke_test_output/
-__pycache__/
+.git
+.gitignore
+.venv
+.venv-test
+__pycache__
+**/__pycache__
 *.pyc
-.pytest_cache/
-.git/
+out/
+data/
+benchmark_inputs/
+benchmark_output/
+docs/images
+PLAN.md
+DEPLOY.md
+# Must never reach the image. The SDK treats a present test_input.json as
+# "run locally", so the worker would execute one fake job and exit instead of
+# polling the queue — which looks exactly like an endpoint that never starts.
+test_input.json

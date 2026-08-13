@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
+import subprocess
 from contextlib import contextmanager
+from fractions import Fraction
 from pathlib import Path
 from typing import Iterator
 
@@ -21,6 +24,30 @@ def _open_capture(path: Path) -> Iterator[cv2.VideoCapture]:
         yield capture
     finally:
         capture.release()
+
+
+def _probe_frame_rate(path: Path) -> Fraction | None:
+    """Exact frame rate from the container, as a rational.
+
+    OpenCV's CAP_PROP_FPS is a float and is measurably wrong on real files —
+    29.991793 for a clip whose true rate is 30000/1001 (29.970030). Encoding the
+    matte at that value makes it run 0.07% fast, which is a full frame of drift
+    against the source by the 46-second mark. Nothing downstream can recover it,
+    so read the real value here.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        rate = Fraction(result.stdout.strip())
+    except (ValueError, ZeroDivisionError):
+        return None
+    return rate if rate > 0 else None
 
 
 class VideoSource:
@@ -43,14 +70,30 @@ class VideoSource:
 
             # cv2.CAP_PROP_FRAME_COUNT over-reports vs. actually-decodable frames on
             # some containers — count by reading, not by trusting the header.
+            # grab() decodes exactly as read() does but skips the copy into a numpy
+            # array, which is the expensive half when the pixels are discarded.
             read_count = 0
-            while True:
-                ok, _ = capture.read()
-                if not ok:
-                    break
+            while capture.grab():
                 read_count += 1
 
-        return VideoMetadata(path=self.path, fps=fps, width=width, height=height, frame_count=read_count)
+        if read_count == 0:
+            raise ValueError(f"no decodable frames in {self.path}")
+
+        exact = _probe_frame_rate(self.path)
+        fps_rational = ""
+        if exact is not None:
+            fps, fps_rational = float(exact), f"{exact.numerator}/{exact.denominator}"
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError(
+                f"{self.path} reports an unusable frame rate ({fps!r}). Re-encode to a "
+                "constant frame rate first, e.g. `ffmpeg -i in.mp4 -r 30 out.mp4` — "
+                "guessing here would silently desync the matte from the source."
+            )
+
+        return VideoMetadata(
+            path=self.path, fps=fps, width=width, height=height,
+            frame_count=read_count, fps_rational=fps_rational,
+        )
 
     def iter_frames(self) -> Iterator[tuple[int, np.ndarray]]:
         with _open_capture(self.path) as capture:
@@ -59,6 +102,54 @@ class VideoSource:
                 ok, frame = capture.read()
                 if not ok:
                     break
+                yield index, frame
+                index += 1
+
+    @staticmethod
+    def iter_range(
+        capture: cv2.VideoCapture,
+        start_index: int,
+        limit_index: int,
+        reverse: bool,
+        window: int = 64,
+    ) -> Iterator[tuple[int, np.ndarray]]:
+        """Yield (index, frame) from `start_index` toward `limit_index`, inclusive.
+
+        Forward is a plain sequential read after one seek.
+
+        Backward is the reason this exists. Video cannot be decoded in reverse, so
+        naively seeking per frame makes each `capture.set(CAP_PROP_POS_FRAMES, i)`
+        decode from the preceding keyframe — around 125 hidden frame-decodes per
+        requested frame at a typical 250-frame GOP. Reading a window forward into
+        memory and then walking it backwards pays one seek per `window` frames
+        instead of one per frame. The model sees identical pixels in identical
+        order; only the disk access pattern changes.
+        """
+        if reverse:
+            cursor = start_index
+            while cursor >= limit_index:
+                low = max(limit_index, cursor - window + 1)
+                capture.set(cv2.CAP_PROP_POS_FRAMES, low)
+
+                buffered: list[np.ndarray] = []
+                for _ in range(cursor - low + 1):
+                    ok, frame = capture.read()
+                    if not ok:
+                        break
+                    buffered.append(frame)
+                if not buffered:
+                    return
+
+                for offset in range(len(buffered) - 1, -1, -1):
+                    yield low + offset, buffered[offset]
+                cursor = low - 1
+        else:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, start_index)
+            index = start_index
+            while index <= limit_index:
+                ok, frame = capture.read()
+                if not ok:
+                    return
                 yield index, frame
                 index += 1
 
