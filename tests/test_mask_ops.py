@@ -47,8 +47,26 @@ class TestCleanMask(unittest.TestCase):
         mask[70:76, 35:41] = 0  # interior hole inside blob A
         return mask
 
-    def test_bridges_gap_into_one_component(self):
+    def test_keeps_side_by_side_blobs_separate(self):
+        # An arm standing off the torso. Bridging these is what let fill_holes
+        # flood the enclosed triangle and swallow the negative space a caption
+        # behind the subject shows through, so the close must NOT join them
+        # however wide the kernel is — it only ever bridges vertically.
         mask = self._dumbbell_with_gap_and_hole()
+        _, before_components = ndimage.label(mask > 0)
+        self.assertEqual(before_components, 2)
+
+        cleaned = clean_mask(mask, close_kernel_size=45)
+        _, after_components = ndimage.label(cleaned > 0)
+        self.assertEqual(after_components, 2)
+
+    def test_closes_horizontal_cut_across_subject(self):
+        # What the close exists for: something slicing straight across the
+        # subject — a burned-in graphic, a strap, a mic lead — leaving a band
+        # that shows as a gap in the composite.
+        mask = np.zeros((200, 200), dtype=np.uint8)
+        mask[40:160, 60:140] = 255
+        mask[95:105, 60:140] = 0  # 10px cut, full width of the blob
         _, before_components = ndimage.label(mask > 0)
         self.assertEqual(before_components, 2)
 

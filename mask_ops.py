@@ -17,11 +17,16 @@ import numpy as np
 
 from datatypes import TrackerConfig
 
-# Default close kernel. Was 45, which reliably bridged an arm to the torso and
-# then let binary_fill_holes flood the enclosed triangle solid — swallowing
-# exactly the negative space that a caption behind the subject shows through.
-# 7 still closes tracking speckle; hole filling is unchanged and independent.
-DEFAULT_CLOSE_KERNEL_SIZE = 7
+# Height of the close kernel, which is one pixel WIDE — see clean_mask.
+#
+# A square kernel forces a choice between two failures. At 45 it bridges an arm
+# to the torso and binary_fill_holes then floods the enclosed triangle solid,
+# swallowing exactly the negative space a caption behind the subject shows
+# through. At 7 that is safe, but anything cutting horizontally across the
+# subject survives into the matte: a burned-in graphic, a strap, a mic lead. A
+# real 2160x2160 frame carried two 35px bands straight across the torso where an
+# annotation box crossed it, and they showed as gaps in the composite.
+DEFAULT_CLOSE_KERNEL_SIZE = 45
 
 # Gaussian sigma for the edge feather, in pixels. SAM2's decoder works at 256x256
 # and everything above that is interpolation, so its "soft" logits are a
@@ -100,6 +105,13 @@ def clean_mask(
 
     The close bridges small local gaps (e.g. a waist notch during fast motion)
     that global disruption signals are too coarse to catch.
+
+    The kernel is a 1-pixel-wide COLUMN, not a square. What gets lost in practice
+    is a horizontal cut across the subject, and closing that only ever requires
+    bridging vertically; a column cannot fuse two things standing side by side,
+    so an arm stays separate from the torso however tall the kernel gets. It is
+    also separable, so 1x45 costs about as much as the 7x7 ellipse it replaces
+    (1.4 ms vs 0.9 ms per 1080x1920 frame) where a 45x45 ellipse costs 33 ms.
     """
     binary = mask > 127
     if not binary.any():
@@ -107,9 +119,7 @@ def clean_mask(
 
     solid = binary.astype(np.uint8) * 255
     if close_kernel_size > 1:
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (close_kernel_size, close_kernel_size)
-        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, close_kernel_size))
         solid = cv2.morphologyEx(solid, cv2.MORPH_CLOSE, kernel)
     return feather_mask(fill_holes(solid), feather_sigma)
 
