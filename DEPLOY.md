@@ -63,7 +63,7 @@ Six of these differ from the defaults. Each one is a real failure otherwise.
 | Field | Value | Why |
 |---|---|---|
 | Endpoint type | **Queue** | Load-balancing endpoints cap at ~5.5 min of processing; our jobs run 2–5 min |
-| GPU priority | **RTX 4090 PRO** → A6000/A40 → L40S | **Availability**, not cost. Below five workers every worker uses the highest-priority type available, so this is pure fallback, not distribution. Listed cheapest-first because per-second rates differ materially: 4090 PRO $0.00031, A6000/A40 $0.00034, L40S $0.00053. A dearer card only breaks even if it is proportionally faster, which is unproven — do not assume it is free to fall back. |
+| GPU priority | **RTX 4090 PRO** → A6000/A40 → L40S → Blackwell | **Availability**, not cost. Below five workers every worker uses the highest-priority type available, so this is pure fallback, not distribution. Listed cheapest-first because per-second rates differ materially: 4090 PRO $0.00031, A6000/A40 $0.00034, L40S $0.00053. A dearer card only breaks even if it is proportionally faster, which is unproven — do not assume it is free to fall back. Blackwell cards (5090, RTX PRO 6000) are only safe on the cu128 image — see §3a. |
 | Active workers | **0** | Scale to zero. A single always-on worker is ~$790/mo. |
 | Max workers | **3** | Queue capacity is `max_workers × 100` |
 | GPUs per worker | **1** | Tracking is sequential; a second GPU idles |
@@ -72,10 +72,60 @@ Six of these differ from the defaults. Each one is a real failure otherwise.
 | Job TTL | **86400 s** | Clock starts at *submission* and includes queue time |
 | **Container disk** | **50 GB** *(default 20)* | Ephemeral scratch; the image alone is ~9 GB |
 | FlashBoot | **on** | Free. Snapshots the warmed worker → ~7s restarts instead of ~70s |
-| **CUDA version** | **12.4 and all newer** | The image ships cu124 wheels. Landing on an older driver reproduces `NVIDIA driver too old (found version 12040)` — the exact failure this repo was debugged through. CUDA is forward-compatible, so a wider selection means more available hardware. |
+| **CUDA version** | **12.8 and all newer** | The image ships cu128 wheels. Landing on an older driver reproduces `NVIDIA driver too old` — a failure this repo was debugged through. CUDA is forward-compatible, so a wider selection means more available hardware. **Do not lower this back to 12.4** to widen the pool: the driver filter says nothing about GPU *architecture*, and the cu124 image it used to imply had no Blackwell kernels — see §3a. |
 | Auto-scaling | **Request count**, value `1` | Default is queue-delay at 4s. Request count fans a burst out immediately rather than trickling. |
 | Data centers | **all** | Restricting shrinks the GPU pool |
 | Network volume | **none** | Pins the endpoint to one datacenter |
+
+### 3a. GPU architecture vs. driver version — they are different filters
+
+Symptom, seen in production: jobs succeed on a 4090 and every other card fails
+at worker start with
+
+```
+RuntimeError: CUDA initialization failed: Failed to initialize GPU 0:
+CUDA error: no kernel image is available for execution on the device
+```
+
+That is **not** a driver problem, and the CUDA-version dropdown will not fix it.
+It means the torch binary carries no compiled kernels for that GPU's compute
+capability.
+
+| | What it gates | What it does *not* gate |
+|---|---|---|
+| Endpoint **CUDA version** filter | Host **driver** version | GPU architecture |
+| Base image's **torch build** | GPU **architecture** | Driver version |
+
+A Blackwell host runs a 12.8+ driver, so it sails through a "12.4 and newer"
+filter — and then torch has nothing to execute on it.
+
+| torch build | Compiled for | Covers |
+|---|---|---|
+| 2.6.0 + cu124 *(previous)* | sm_50 … sm_90 | Maxwell → Hopper. **No Blackwell.** |
+| 2.8.0 + cu128 *(current)* | sm_75 … sm_120 | Turing → Blackwell |
+
+Two things make this non-obvious:
+
+* **The 4090 is sm_89 and no build compiles for it by name.** It runs on the
+  sm_86 cubin, because CUDA binaries are forward-compatible *within* a major
+  version. That compatibility does not cross majors, which is why sm_90 kernels
+  cannot carry an sm_120 card.
+* **The old build guard could not catch it.** It asserted `torch.version.cuda`
+  was set, which is true on any CUDA build. RunPod's builder has no GPU, so
+  nothing failed until a worker landed on the wrong card.
+
+Both are now closed:
+
+* `Dockerfile.serverless` asserts `torch.cuda.get_arch_list()` contains
+  `sm_86`, `sm_90` and `sm_120`, and prints the full list. Needs no GPU, so it
+  fails the **build** rather than a worker.
+* `rp_handler._select_device()` compares the live card's capability against the
+  arch list at import and raises with the GPU name, its `sm_XX`, and the arch
+  list. It also refuses to fall back to CPU — that fallback used to run to the
+  900s execution timeout and bill for it.
+
+**If you must unblock without rebuilding:** deselect Blackwell types on the
+endpoint. 4090 (sm_89), A6000/A40 (sm_86) and L40S (sm_89) all run on cu124.
 
 ### On "load the models at deploy"
 
@@ -308,5 +358,5 @@ workers. If the balance is low, raising max workers may silently not take.
 7. **Updates need a GitHub release**, not a push. RunPod's launch blog says otherwise and is stale.
 8. **Container disk is ephemeral** and wiped on restart.
 9. **An idle endpoint scales its own max workers to 0 after 7 days** and stays there — see §8b.
-10. **CUDA selection left unset** can land the cu124 image on an older driver.
+10. **CUDA selection left unset** can land the image on an older driver. And note it gates the *driver*, not the GPU architecture — a permissive setting still lets an unsupported card through. See §3a.
 11. **Async results are retained only 30 minutes.** A 404 from `/status` is terminal — the job was deleted, not delayed. `settleJob` already treats it that way.

@@ -11,6 +11,7 @@ needs real weights.
 """
 
 import hashlib
+import os
 import sys
 import types
 import unittest
@@ -73,6 +74,10 @@ def _install_stubs() -> None:
 
 
 _install_stubs()
+# The handler refuses to start without a usable GPU — on a worker, a CPU
+# fallback silently burns the execution timeout. These tests are the one
+# legitimate CPU-only caller, so they opt in explicitly.
+os.environ["ALLOW_CPU"] = "1"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import rp_handler  # noqa: E402
 
@@ -259,6 +264,87 @@ class TestWorkerIsolation(unittest.TestCase):
         # that RunPod bills as worker start time.
         for name in ("_detector", "_segmenter", "_tracker"):
             self.assertIsNotNone(getattr(rp_handler, name, None), name)
+
+
+class TestArchParsing(unittest.TestCase):
+    """`sm_120` is 12.0, not 1.20 — the minor version is the last digit."""
+
+    def test_two_digit_arch(self):
+        self.assertEqual(rp_handler._parse_arch("sm_86"), (8, 6))
+
+    def test_three_digit_blackwell_arch(self):
+        self.assertEqual(rp_handler._parse_arch("sm_120"), (12, 0))
+        self.assertEqual(rp_handler._parse_arch("sm_100"), (10, 0))
+
+    def test_arch_conditional_suffix_is_stripped(self):
+        self.assertEqual(rp_handler._parse_arch("sm_90a"), (9, 0))
+
+    def test_ptx_entries_are_ignored(self):
+        self.assertIsNone(rp_handler._parse_arch("compute_120"))
+
+
+class TestDeviceSelection(unittest.TestCase):
+    """The guard that turns a silent CPU fallback into a startup crash."""
+
+    CU124 = ["sm_50", "sm_60", "sm_70", "sm_75", "sm_80", "sm_86", "sm_90"]
+    CU128 = ["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120", "compute_120"]
+
+    def _run(self, arch_list, capability, name="Test GPU"):
+        cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda: capability,
+            get_arch_list=lambda: arch_list,
+            get_device_name=lambda *a: name,
+        )
+        with mock.patch.object(rp_handler.torch, "cuda", cuda), \
+                mock.patch.object(rp_handler.torch, "__version__", "x", create=True), \
+                mock.patch.object(rp_handler.torch, "version",
+                                  types.SimpleNamespace(cuda="x"), create=True):
+            return rp_handler._select_device()
+
+    def test_blackwell_on_cu124_is_refused(self):
+        # The production failure: RTX 5090 is sm_120, outside cu124's list.
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(self.CU124, (12, 0), name="NVIDIA GeForce RTX 5090")
+        message = str(ctx.exception)
+        self.assertIn("sm_120", message)
+        self.assertIn("RTX 5090", message)
+
+    def test_blackwell_on_cu128_is_accepted(self):
+        self.assertEqual(self._run(self.CU128, (12, 0)), "cuda")
+
+    def test_ada_is_accepted_via_the_sm_86_cubin(self):
+        # 4090/L40S are sm_89 and no build compiles for it explicitly; they run
+        # on the sm_86 binary because cubins are forward-compatible within a
+        # major version. This is why the 4090 kept working through the outage.
+        self.assertEqual(self._run(self.CU124, (8, 9)), "cuda")
+        self.assertEqual(self._run(self.CU128, (8, 9)), "cuda")
+
+    def test_hopper_is_accepted(self):
+        self.assertEqual(self._run(self.CU124, (9, 0)), "cuda")
+
+    def test_arch_below_the_lowest_compiled_minor_is_refused(self):
+        # sm_70 hardware cannot run an sm_75 cubin; compatibility is forward only.
+        with self.assertRaises(RuntimeError):
+            self._run(self.CU128, (7, 0))
+
+    def test_no_gpu_is_refused_rather_than_falling_back(self):
+        cuda = types.SimpleNamespace(is_available=lambda: False)
+        with mock.patch.object(rp_handler, "_ALLOW_CPU", False), \
+                mock.patch.object(rp_handler.torch, "cuda", cuda):
+            with self.assertRaises(RuntimeError) as ctx:
+                rp_handler._select_device()
+        self.assertIn("CPU", str(ctx.exception))
+
+    def test_cuda_init_failure_is_reraised_with_context(self):
+        def boom():
+            raise RuntimeError("no kernel image is available for execution on the device")
+
+        cuda = types.SimpleNamespace(is_available=boom)
+        with mock.patch.object(rp_handler.torch, "cuda", cuda):
+            with self.assertRaises(RuntimeError) as ctx:
+                rp_handler._select_device()
+        self.assertIn("no kernel image", str(ctx.exception))
 
 
 if __name__ == "__main__":
