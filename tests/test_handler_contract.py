@@ -137,7 +137,8 @@ class TestGuards(unittest.TestCase):
     def setUp(self):
         self.workdir = Path("/tmp")
 
-    def _run(self, probe, metadata=None):
+    def _run(self, probe, metadata=None, **extra_input):
+        job_input = {"video_url": "https://x/v.mp4", **extra_input}
         with mock.patch.object(rp_handler, "_remote_identity", return_value=None), \
              mock.patch.object(rp_handler, "_download", return_value="deadbeef"), \
              mock.patch.object(rp_handler, "_already_done", return_value=False), \
@@ -145,7 +146,7 @@ class TestGuards(unittest.TestCase):
              mock.patch.object(rp_handler, "_probe", return_value=probe), \
              mock.patch.object(rp_handler, "VideoSource") as vs:
             vs.return_value.load_metadata.return_value = metadata
-            return rp_handler.handler({"id": "j", "input": {"video_url": "https://x/v.mp4"}})
+            return rp_handler.handler({"id": "j", "input": job_input})
 
     def test_over_length_clip_is_refused(self):
         out = self._run({"width": 1080, "height": 1920, "duration": 9999.0})
@@ -166,6 +167,105 @@ class TestGuards(unittest.TestCase):
         meta = types.SimpleNamespace(frame_count=300, width=1080, height=1920, fps=30.0)
         out = self._run({"width": 1080, "height": 1920, "duration": 10.0}, meta)
         self.assertNotIn(out.get("code"), ("too_long", "too_large"))
+
+
+class TestProjectedMaskBytes(unittest.TestCase):
+    """Masks are stored downscaled, so the projection must be too.
+
+    `tracker.track` calls `downscale_mask` the moment a mask leaves the GPU, so
+    what accumulates in host RAM is the *capped* size, never the source size.
+    """
+
+    UHD = (3840, 2160)
+
+    def test_source_resolution_when_uncapped(self):
+        self.assertEqual(
+            rp_handler._projected_mask_bytes(*self.UHD, frame_count=10, max_mask_height=0),
+            10 * 3840 * 2160,
+        )
+
+    def test_cap_scales_both_dimensions(self):
+        # 2160 -> 720 is a third of the height, so a third of the width too:
+        # 9x fewer bytes, not 3x. Capping only the height would understate it.
+        self.assertEqual(
+            rp_handler._projected_mask_bytes(*self.UHD, frame_count=10, max_mask_height=720),
+            10 * 1280 * 720,
+        )
+
+    def test_cap_above_source_height_is_a_no_op(self):
+        self.assertEqual(
+            rp_handler._projected_mask_bytes(1280, 720, frame_count=10, max_mask_height=2160),
+            10 * 1280 * 720,
+        )
+
+    def test_matches_downscale_mask_for_odd_aspect_ratios(self):
+        # The projection has to agree with the real thing or the guard is
+        # protecting a number nothing produces.
+        import numpy as np
+
+        from mask_ops import downscale_mask
+
+        width, height, cap = 1001, 733, 300
+        actual = downscale_mask(np.zeros((height, width), dtype=np.uint8), cap)
+        self.assertEqual(
+            rp_handler._projected_mask_bytes(width, height, frame_count=1, max_mask_height=cap),
+            actual.shape[0] * actual.shape[1],
+        )
+
+
+class TestLargestFittingHeight(unittest.TestCase):
+    """The rejection should name a height that works, not guess '720p'."""
+
+    def test_suggests_a_height_that_actually_fits(self):
+        suggested = rp_handler._largest_fitting_height(3840, 2160, frame_count=4900)
+        self.assertIsNotNone(suggested)
+        self.assertLessEqual(
+            rp_handler._projected_mask_bytes(3840, 2160, 4900, suggested),
+            rp_handler.MAX_MASK_BYTES,
+        )
+
+    def test_returns_none_when_no_height_helps(self):
+        # Downscaling cannot save a clip this long; the caller needs to trim.
+        self.assertIsNone(rp_handler._largest_fitting_height(3840, 2160, frame_count=10**8))
+
+
+class TestMaskMemoryGuard(TestGuards):
+    """4K regression: the guard ignored the parameter that fixes it.
+
+    `max_mask_height` was applied to the tracker 13 lines *after* the guard ran,
+    so a 4K job was refused on its source-resolution footprint even when the
+    request had already asked for masks small enough to fit.
+    """
+
+    UHD_4900 = types.SimpleNamespace(frame_count=4900, width=3840, height=2160, fps=30.0)
+    PROBE = {"width": 3840, "height": 2160, "duration": 163.0}
+
+    def test_4k_is_refused_at_source_resolution(self):
+        out = self._run(self.PROBE, self.UHD_4900)
+        self.assertIs(out["ok"], False)
+        self.assertEqual(out["code"], "too_large")
+
+    def test_4k_is_accepted_when_the_cap_makes_it_fit(self):
+        # 4900 frames at 1280x720 is ~4.2 GB, well inside the 8 GB limit.
+        out = self._run(self.PROBE, self.UHD_4900, max_mask_height=720)
+        self.assertNotEqual(out.get("code"), "too_large")
+
+    def test_4k_is_still_refused_when_the_cap_is_too_generous(self):
+        # 4900 frames at 1920x1080 is ~9.5 GB — over the limit even downscaled.
+        out = self._run(self.PROBE, self.UHD_4900, max_mask_height=1080)
+        self.assertIs(out["ok"], False)
+        self.assertEqual(out["code"], "too_large")
+
+    def test_rejection_names_a_height_that_would_fit(self):
+        out = self._run(self.PROBE, self.UHD_4900)
+        self.assertIn("max_mask_height", out["reason"])
+        self.assertIn(str(out["suggested_max_mask_height"]), out["reason"])
+
+    def test_rejection_reports_the_downscaled_projection(self):
+        # Reporting the source-resolution figure when a cap was requested tells
+        # the caller to fix something they already did.
+        out = self._run(self.PROBE, self.UHD_4900, max_mask_height=1080)
+        self.assertAlmostEqual(out["projected_gb"], 9.5, places=1)
 
 
 class TestEdgeCases(unittest.TestCase):

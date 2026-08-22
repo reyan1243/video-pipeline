@@ -381,6 +381,44 @@ def _rejected(code: str, reason: str, **extra) -> dict:
     return {"ok": False, "code": code, "reason": reason, **extra}
 
 
+# Heights a caller would plausibly pick, largest first. The guard suggests from
+# this ladder rather than solving for the exact maximum, so the advice is a
+# round number rather than something like 967.
+_HEIGHT_LADDER = (2160, 1440, 1080, 960, 720, 540, 480, 360, 240)
+
+
+def _projected_mask_bytes(
+    width: int, height: int, frame_count: int, max_mask_height: int
+) -> int:
+    """Host RAM the stored masks will occupy, at one byte per pixel.
+
+    Mirrors `mask_ops.downscale_mask`, and must keep mirroring it. The tracker
+    caps every mask the moment it leaves the GPU, so source resolution is never
+    what accumulates — projecting from it over-reports by the *square* of the
+    scale factor (9x for 2160 -> 720) and refuses jobs that would have fit.
+    """
+    if max_mask_height > 0 and height > max_mask_height:
+        scale = max_mask_height / height
+        width = max(2, int(round(width * scale)))
+        height = max_mask_height
+    return frame_count * width * height
+
+
+def _largest_fitting_height(width: int, height: int, frame_count: int) -> int | None:
+    """Biggest ladder height whose masks fit the budget, or None if none do.
+
+    None means the clip is too long for downscaling to rescue: bytes fall with
+    the square of the height, but they rise linearly with frame count, and past
+    a certain length no cap is enough.
+    """
+    for candidate in _HEIGHT_LADDER:
+        if candidate > height:
+            continue
+        if _projected_mask_bytes(width, height, frame_count, candidate) <= MAX_MASK_BYTES:
+            return candidate
+    return None
+
+
 def _put_presigned(local: Path, url: str, content_type: str = "video/mp4") -> None:
     """Upload via a presigned PUT supplied by the caller.
 
@@ -523,15 +561,36 @@ def _handle(job):
         video = VideoSource(clip)
         metadata = video.load_metadata()
 
-        projected = metadata.frame_count * metadata.width * metadata.height
+        # Project from the *capped* mask size, not the source. `max_mask_height`
+        # is honoured by the tracker a few lines below, so measuring the source
+        # here refused 4K jobs whose request had already asked for masks small
+        # enough to fit — while advising a downscale the caller had done.
+        projected = _projected_mask_bytes(
+            metadata.width, metadata.height, metadata.frame_count, max_mask_height
+        )
         if projected > MAX_MASK_BYTES:
+            suggested = _largest_fitting_height(
+                metadata.width, metadata.height, metadata.frame_count
+            )
+            actionable = suggested is not None and (
+                max_mask_height <= 0 or suggested < max_mask_height
+            )
+            advice = (
+                f"Pass max_mask_height={suggested} to cap the masks, or use "
+                "start_time/end_time to process a shorter range."
+                if actionable
+                else "No mask height is small enough at this length — use "
+                "start_time/end_time to process a shorter range."
+            )
             return _rejected(
                 "too_large",
                 f"job would need ~{projected / 1024**3:.1f} GB of mask memory "
-                f"(limit {MAX_MASK_BYTES / 1024**3:.1f} GB). Downscale to 720p, or "
-                "use start_time/end_time to process a shorter range.",
+                f"(limit {MAX_MASK_BYTES / 1024**3:.1f} GB). {advice}",
                 frames=metadata.frame_count,
                 resolution=f"{metadata.width}x{metadata.height}",
+                projected_gb=round(projected / 1024**3, 1),
+                max_mask_height=max_mask_height,
+                suggested_max_mask_height=suggested,
             )
 
         # TrackerConfig is frozen, so a per-request override rebuilds it. The

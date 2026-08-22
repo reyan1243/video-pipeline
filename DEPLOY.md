@@ -263,7 +263,7 @@ from a crash — so caller-actionable problems come back as `ok: false` instead.
 | `invalid_range` | `start_time` negative, or `end_time` <= `start_time` |
 | `source_unavailable` | the URL 4xx'd or was unreachable. **A 401/403 usually means the presigned URL expired while the job sat in the queue** — sign it for longer than the job TTL. |
 | `too_long` | over `MAX_DURATION_SECONDS` — pass `start_time`/`end_time` |
-| `too_large` | over the mask-RAM guard — downscale or shorten |
+| `too_large` | over the mask-RAM guard. The response carries `suggested_max_mask_height` — retry with that, or shorten the range. `null` there means no cap is small enough and only trimming helps. |
 | `incomplete_coverage` | subject lost — better prompt, or split the clip |
 | `invalid_input` | unfetchable URL, oversized file, unusable frame rate |
 | `ffmpeg_failed` | trim or probe failed |
@@ -294,7 +294,7 @@ cancel early when a user abandons.
 | `mask_close_kernel_size` | `7` | larger values swallow arm-to-torso gaps |
 | `feather_sigma` | `1.0` | edge softness in px; `0` = hard edge |
 | `temporal_smoothing` | `false` | measured jitter is already 0.2–0.65px, so leave off |
-| `max_mask_height` | `0` | `960` on a 1080p source quarters cleanup/encode for ~no quality loss |
+| `max_mask_height` | `0` | Caps mask height, preserving aspect. `960` on a 1080p source quarters cleanup/encode for ~no quality loss. **Also relieves the `too_large` guard** — bytes fall with the square of the height, so 2160 -> 720 is 9x less, not 3x. |
 
 ---
 
