@@ -95,6 +95,12 @@ MAX_SEGMENT_FRAMES = int(os.environ.get("MAX_SEGMENT_FRAMES", 600))
 # internally, so 960 on a 1080p source discards almost no real detail while
 # quartering mask cleanup, encoding and RAM — which together outweigh tracking.
 MAX_MASK_HEIGHT = int(os.environ.get("MAX_MASK_HEIGHT", 0))
+# Sources taller than this get a default mask cap applied for them. A 4K matte
+# carries no more real information than a 720p one — SAM2's decoder emits
+# 256x256 logits and everything above that is interpolation — while costing 9x
+# the host RAM, cleanup and encode time.
+LARGE_SOURCE_HEIGHT = int(os.environ.get("LARGE_SOURCE_HEIGHT", 1440))
+DEFAULT_LARGE_MASK_HEIGHT = int(os.environ.get("DEFAULT_LARGE_MASK_HEIGHT", 720))
 MODEL_SIZE = os.environ.get("MODEL_SIZE", "large")
 # bfloat16 weights halve the ~2.7GB that moves disk -> GPU at worker start.
 # RunPod bills that start time, so this is a direct cold-start saving.
@@ -419,6 +425,32 @@ def _largest_fitting_height(width: int, height: int, frame_count: int) -> int | 
     return None
 
 
+def _auto_mask_height(width: int, height: int, frame_count: int, requested: int) -> int:
+    """The cap to actually apply: resolution picks the default, budget the floor.
+
+    Frame rate never appears here, and does not need to — it is already inside
+    `frame_count`, so a 300s 60fps clip and a 600s 30fps one are the same
+    problem and get the same answer.
+
+    An explicit `requested` is returned untouched, even when it will not fit.
+    Silently substituting a different value would hand back a matte at a
+    resolution nobody asked for; the guard refuses it instead and names one
+    that works.
+    """
+    if requested > 0:
+        return requested
+
+    cap = DEFAULT_LARGE_MASK_HEIGHT if height > LARGE_SOURCE_HEIGHT else 0
+    if _projected_mask_bytes(width, height, frame_count, cap) <= MAX_MASK_BYTES:
+        return cap
+
+    # The default was not enough — a long clip, a high frame rate, or both.
+    # Drop to the largest rung that fits. If nothing does, keep the default so
+    # the guard refuses with an honest figure rather than a fantasy one.
+    fitting = _largest_fitting_height(width, height, frame_count)
+    return cap if fitting is None else fitting
+
+
 def _put_presigned(local: Path, url: str, content_type: str = "video/mp4") -> None:
     """Upload via a presigned PUT supplied by the caller.
 
@@ -561,19 +593,22 @@ def _handle(job):
         video = VideoSource(clip)
         metadata = video.load_metadata()
 
-        # Project from the *capped* mask size, not the source. `max_mask_height`
-        # is honoured by the tracker a few lines below, so measuring the source
-        # here refused 4K jobs whose request had already asked for masks small
-        # enough to fit — while advising a downscale the caller had done.
-        projected = _projected_mask_bytes(
+        # Resolve the cap before measuring: a large source gets one applied for
+        # it, and the tracker honours it a few lines below. Projecting from the
+        # source instead refused 4K jobs whose masks were never going to be
+        # stored at 4K — while advising a downscale that had already happened.
+        applied_mask_height = _auto_mask_height(
             metadata.width, metadata.height, metadata.frame_count, max_mask_height
+        )
+        projected = _projected_mask_bytes(
+            metadata.width, metadata.height, metadata.frame_count, applied_mask_height
         )
         if projected > MAX_MASK_BYTES:
             suggested = _largest_fitting_height(
                 metadata.width, metadata.height, metadata.frame_count
             )
             actionable = suggested is not None and (
-                max_mask_height <= 0 or suggested < max_mask_height
+                applied_mask_height <= 0 or suggested < applied_mask_height
             )
             advice = (
                 f"Pass max_mask_height={suggested} to cap the masks, or use "
@@ -590,12 +625,13 @@ def _handle(job):
                 resolution=f"{metadata.width}x{metadata.height}",
                 projected_gb=round(projected / 1024**3, 1),
                 max_mask_height=max_mask_height,
+                applied_max_mask_height=applied_mask_height,
                 suggested_max_mask_height=suggested,
             )
 
         # TrackerConfig is frozen, so a per-request override rebuilds it. The
         # tracker reads self.config on every frame, so reassigning is enough.
-        _tracker.config = replace(_TRACKER_CONFIG, max_mask_height=max_mask_height)
+        _tracker.config = replace(_TRACKER_CONFIG, max_mask_height=applied_mask_height)
 
         _detector.prompt = _normalize_prompt(prompt)
         _segmenter.num_candidates = num_seed_candidates
@@ -649,6 +685,9 @@ def _handle(job):
             "fps": metadata.fps,
             "width": export.width,
             "height": export.height,
+            # The matte ships at mask resolution, so a caller that did not pick
+            # the cap still needs to know which one was applied for it.
+            "applied_max_mask_height": applied_mask_height,
             "seed_frame": seed.frame_index,
             "seed_iou": round(seed.iou_score, 3),
             "coverage": 1.0,

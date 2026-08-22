@@ -240,10 +240,11 @@ class TestMaskMemoryGuard(TestGuards):
     UHD_4900 = types.SimpleNamespace(frame_count=4900, width=3840, height=2160, fps=30.0)
     PROBE = {"width": 3840, "height": 2160, "duration": 163.0}
 
-    def test_4k_is_refused_at_source_resolution(self):
+    def test_uncapped_4k_is_auto_capped_rather_than_refused(self):
+        # Was a rejection. A 4K source now gets the default cap applied for it.
         out = self._run(self.PROBE, self.UHD_4900)
-        self.assertIs(out["ok"], False)
-        self.assertEqual(out["code"], "too_large")
+        self.assertNotEqual(out.get("code"), "too_large")
+        self.assertEqual(rp_handler._tracker.config.max_mask_height, 720)
 
     def test_4k_is_accepted_when_the_cap_makes_it_fit(self):
         # 4900 frames at 1280x720 is ~4.2 GB, well inside the 8 GB limit.
@@ -257,7 +258,9 @@ class TestMaskMemoryGuard(TestGuards):
         self.assertEqual(out["code"], "too_large")
 
     def test_rejection_names_a_height_that_would_fit(self):
-        out = self._run(self.PROBE, self.UHD_4900)
+        # An explicit cap wins, so an explicit cap that does not fit still gets
+        # refused — and the message must name one that would.
+        out = self._run(self.PROBE, self.UHD_4900, max_mask_height=1080)
         self.assertIn("max_mask_height", out["reason"])
         self.assertIn(str(out["suggested_max_mask_height"]), out["reason"])
 
@@ -266,6 +269,111 @@ class TestMaskMemoryGuard(TestGuards):
         # the caller to fix something they already did.
         out = self._run(self.PROBE, self.UHD_4900, max_mask_height=1080)
         self.assertAlmostEqual(out["projected_gb"], 9.5, places=1)
+
+
+class TestAutoMaskHeight(unittest.TestCase):
+    """Resolution picks the default cap; the memory budget picks the floor.
+
+    Frame rate never appears here on purpose — it is already inside
+    `frame_count`, so a 60fps clip is handled by the same budget check that
+    handles a long 30fps one.
+    """
+
+    UHD = (3840, 2160)
+    HD = (1920, 1080)
+
+    def test_explicit_request_wins_even_when_it_does_not_fit(self):
+        # The caller asked for 1080 on a clip where it overflows. That is their
+        # call to make; the guard refuses it rather than silently substituting.
+        self.assertEqual(
+            rp_handler._auto_mask_height(*self.UHD, frame_count=4867, requested=1080), 1080
+        )
+
+    def test_explicit_request_wins_over_the_large_source_default(self):
+        self.assertEqual(
+            rp_handler._auto_mask_height(*self.UHD, frame_count=100, requested=1440), 1440
+        )
+
+    def test_4k_gets_the_default_cap(self):
+        self.assertEqual(
+            rp_handler._auto_mask_height(*self.UHD, frame_count=1217, requested=0), 720
+        )
+
+    def test_1080p_is_left_at_source(self):
+        self.assertEqual(
+            rp_handler._auto_mask_height(*self.HD, frame_count=300, requested=0), 0
+        )
+
+    def test_long_60fps_4k_drops_below_the_default_cap(self):
+        # 300s at 60fps is 18000 frames; 720p would still need 16.6 GB.
+        applied = rp_handler._auto_mask_height(*self.UHD, frame_count=18000, requested=0)
+        self.assertLess(applied, 720)
+        self.assertLessEqual(
+            rp_handler._projected_mask_bytes(*self.UHD, 18000, applied),
+            rp_handler.MAX_MASK_BYTES,
+        )
+
+    def test_long_1080p_is_rescued_even_though_it_is_not_a_large_source(self):
+        # The other half: high frame count on a source below the 4K threshold.
+        applied = rp_handler._auto_mask_height(*self.HD, frame_count=9000, requested=0)
+        self.assertGreater(applied, 0)
+        self.assertLessEqual(
+            rp_handler._projected_mask_bytes(*self.HD, 9000, applied),
+            rp_handler.MAX_MASK_BYTES,
+        )
+
+    def test_falls_back_to_the_default_cap_when_nothing_fits(self):
+        # Nothing rescues this, so the guard must still get a chance to refuse.
+        applied = rp_handler._auto_mask_height(*self.UHD, frame_count=10**8, requested=0)
+        self.assertEqual(applied, 720)
+        self.assertGreater(
+            rp_handler._projected_mask_bytes(*self.UHD, 10**8, applied),
+            rp_handler.MAX_MASK_BYTES,
+        )
+
+
+class TestAutoCapThroughHandler(TestGuards):
+    """The reported 60fps 4K case, end to end."""
+
+    PROBE_4K = {"width": 3840, "height": 2160, "duration": 20.3}
+
+    def test_20s_60fps_4k_is_accepted_and_capped_at_720(self):
+        meta = types.SimpleNamespace(frame_count=1217, width=3840, height=2160, fps=60.0)
+        out = self._run(self.PROBE_4K, meta)
+        self.assertNotEqual(out.get("code"), "too_large")
+        self.assertEqual(rp_handler._tracker.config.max_mask_height, 720)
+
+    def test_300s_60fps_4k_is_accepted_below_the_default_cap(self):
+        meta = types.SimpleNamespace(frame_count=18000, width=3840, height=2160, fps=60.0)
+        out = self._run({**self.PROBE_4K, "duration": 300.0}, meta)
+        self.assertNotEqual(out.get("code"), "too_large")
+        self.assertLess(rp_handler._tracker.config.max_mask_height, 720)
+
+    def test_explicit_zero_still_requests_a_full_resolution_matte(self):
+        # Passing 0 explicitly is indistinguishable from omitting it, so the
+        # documented escape hatch for a source-resolution matte is a small clip.
+        meta = types.SimpleNamespace(frame_count=100, width=1280, height=720, fps=30.0)
+        out = self._run({"width": 1280, "height": 720, "duration": 3.3}, meta)
+        self.assertNotEqual(out.get("code"), "too_large")
+        self.assertEqual(rp_handler._tracker.config.max_mask_height, 0)
+
+    def test_applied_cap_is_reported_to_the_caller(self):
+        # The matte ships at mask resolution (exporter.py), so a caller that did
+        # not choose the cap still has to learn which one was chosen for it.
+        meta = types.SimpleNamespace(frame_count=1217, width=3840, height=2160, fps=60.0)
+        seed = types.SimpleNamespace(frame_index=7, iou_score=0.98)
+        tracking = types.SimpleNamespace(masks={}, coverage=lambda n: 1.0)
+        export = types.SimpleNamespace(matte_path="/tmp/m.mp4", width=1280, height=720)
+        with mock.patch.object(rp_handler._segmenter, "select_seed", return_value=seed), \
+             mock.patch.object(rp_handler._tracker, "track", return_value=tracking), \
+             mock.patch.object(rp_handler, "clean_masks"), \
+             mock.patch.object(rp_handler, "LayerExporter") as exporter, \
+             mock.patch.object(rp_handler, "_upload", return_value="https://signed"):
+            exporter.return_value.export.return_value = export
+            out = self._run(self.PROBE_4K, meta)
+        self.assertIs(out["ok"], True)
+        self.assertEqual(out["applied_max_mask_height"], 720)
+        self.assertEqual((out["width"], out["height"]), (1280, 720))
 
 
 class TestEdgeCases(unittest.TestCase):

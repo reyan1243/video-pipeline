@@ -181,8 +181,41 @@ The variables below are the **standalone fallback**, used only when no
 | `BF16_WEIGHTS` | `1` — measured 22.0s → 16.8s model load, and halves resident VRAM |
 
 Optional, all with sane defaults: `MAX_DURATION_SECONDS` (300),
-`MAX_MASK_HEIGHT` (0 = source resolution), `MODEL_SIZE` (`large`),
-`MAX_SEGMENT_FRAMES` (600), `URL_TTL_SECONDS` (86400).
+`MAX_MASK_HEIGHT` (0 = let the worker choose — see §4a), `MODEL_SIZE` (`large`),
+`MAX_SEGMENT_FRAMES` (600), `URL_TTL_SECONDS` (86400),
+`LARGE_SOURCE_HEIGHT` (1440), `DEFAULT_LARGE_MASK_HEIGHT` (720).
+
+### 4a. How the matte's resolution is chosen
+
+A 4K matte carries no more real information than a 720p one — SAM2's decoder
+emits 256x256 logits and everything above that is interpolation — but it costs
+9x the host RAM, cleanup and encode time. So the worker picks a cap:
+
+1. An explicit `max_mask_height` in the request **wins**, untouched, even if it
+   will not fit. Substituting silently would return a matte at a resolution
+   nobody asked for; the guard refuses instead and names one that works.
+2. Otherwise, a source taller than `LARGE_SOURCE_HEIGHT` (1440) gets
+   `DEFAULT_LARGE_MASK_HEIGHT` (720). 1080p and below are left at source.
+3. If that still exceeds `MAX_MASK_BYTES`, it drops to the largest height that
+   fits.
+4. Only if nothing fits is the job refused as `too_large`.
+
+**Frame rate is not a special case** — it is already inside the frame count, so
+a 300s 60fps clip and a 600s 30fps one get the same answer. That is what makes
+step 3 cover high-fps sources without a separate rule:
+
+| clip | applied cap | mask RAM |
+|---|---|---|
+| 20s 60fps 4K | 720 | 1.0 GB |
+| 162s 30fps 4K | 720 | 4.2 GB |
+| 300s 60fps 4K | 480 | 6.9 GB |
+| 300s 30fps 1080p | 720 | 7.7 GB |
+| 10s 30fps 1080p | source | 0.6 GB |
+
+⚠️ **The matte ships at mask resolution**, not source resolution
+(`exporter.py`), so the delivered file *is* this size. The response returns
+`applied_max_mask_height` alongside `width`/`height` — read them rather than
+assuming the source dimensions.
 
 > After the first deploy, check the worker log for a credential starting with
 > `{{`. RunPod's `{{ RUNPOD_SECRET_name }}` substitution is documented for Pods
@@ -263,7 +296,7 @@ from a crash — so caller-actionable problems come back as `ok: false` instead.
 | `invalid_range` | `start_time` negative, or `end_time` <= `start_time` |
 | `source_unavailable` | the URL 4xx'd or was unreachable. **A 401/403 usually means the presigned URL expired while the job sat in the queue** — sign it for longer than the job TTL. |
 | `too_long` | over `MAX_DURATION_SECONDS` — pass `start_time`/`end_time` |
-| `too_large` | over the mask-RAM guard. The response carries `suggested_max_mask_height` — retry with that, or shorten the range. `null` there means no cap is small enough and only trimming helps. |
+| `too_large` | over the mask-RAM guard *after* auto-capping (§4a), so in practice only an explicit `max_mask_height` that overflows, or a clip no height rescues. The response carries `suggested_max_mask_height`; `null` means only trimming helps. |
 | `incomplete_coverage` | subject lost — better prompt, or split the clip |
 | `invalid_input` | unfetchable URL, oversized file, unusable frame rate |
 | `ffmpeg_failed` | trim or probe failed |
@@ -294,7 +327,7 @@ cancel early when a user abandons.
 | `mask_close_kernel_size` | `7` | larger values swallow arm-to-torso gaps |
 | `feather_sigma` | `1.0` | edge softness in px; `0` = hard edge |
 | `temporal_smoothing` | `false` | measured jitter is already 0.2–0.65px, so leave off |
-| `max_mask_height` | `0` | Caps mask height, preserving aspect. `960` on a 1080p source quarters cleanup/encode for ~no quality loss. **Also relieves the `too_large` guard** — bytes fall with the square of the height, so 2160 -> 720 is 9x less, not 3x. |
+| `max_mask_height` | `0` | `0` lets the worker choose (§4a): 4K+ is capped at 720, and long or high-fps clips drop further. Set it to override — an explicit value always wins, and is refused rather than substituted if it does not fit. |
 
 ---
 
