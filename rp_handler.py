@@ -59,6 +59,7 @@ from botocore.exceptions import ClientError
 
 sys.path.insert(0, "/app")
 
+from arch_guard import compiled_archs, covers  # noqa: E402
 from datatypes import TrackerConfig  # noqa: E402
 from detector import SubjectDetector, _normalize_prompt  # noqa: E402
 from exporter import LayerExporter  # noqa: E402
@@ -117,22 +118,6 @@ MODEL_IDS = {
 _ALLOW_CPU = os.environ.get("ALLOW_CPU", "").strip().lower() in {"1", "true", "yes"}
 
 
-def _parse_arch(arch: str) -> tuple[int, int] | None:
-    """`"sm_86"` -> `(8, 6)`, `"sm_120"` -> `(12, 0)`, `"sm_90a"` -> `(9, 0)`.
-
-    The minor version is always the last digit, so the major is everything
-    before it — `sm_120` is 12.0, not 1.20. Arch-conditional suffixes (`90a`)
-    are trailing letters and get stripped. Returns None for `compute_*` PTX
-    entries and anything unparseable.
-    """
-    if not arch.startswith("sm_"):
-        return None
-    digits = arch[3:].rstrip("abcdef")
-    if len(digits) < 2 or not digits.isdigit():
-        return None
-    return int(digits[:-1]), int(digits[-1])
-
-
 def _select_device() -> str:
     """`"cuda"`, or a loud failure naming the GPU that torch cannot drive.
 
@@ -161,9 +146,8 @@ def _select_device() -> str:
         )
 
     major, minor = torch.cuda.get_device_capability()
-    archs = torch.cuda.get_arch_list()
-    parsed = [p for p in (_parse_arch(a) for a in archs) if p]
-    if not any(a_major == major and a_minor <= minor for a_major, a_minor in parsed):
+    archs = compiled_archs()
+    if not covers(archs, (major, minor)):
         raise RuntimeError(
             f"{torch.cuda.get_device_name()} is sm_{major}{minor}, which torch "
             f"{torch.__version__} (cuda {torch.version.cuda}) has no kernels for. "

@@ -79,6 +79,7 @@ _install_stubs()
 # legitimate CPU-only caller, so they opt in explicitly.
 os.environ["ALLOW_CPU"] = "1"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import arch_guard  # noqa: E402
 import rp_handler  # noqa: E402
 
 
@@ -270,17 +271,63 @@ class TestArchParsing(unittest.TestCase):
     """`sm_120` is 12.0, not 1.20 — the minor version is the last digit."""
 
     def test_two_digit_arch(self):
-        self.assertEqual(rp_handler._parse_arch("sm_86"), (8, 6))
+        self.assertEqual(arch_guard.parse_arch("sm_86"), (8, 6))
 
     def test_three_digit_blackwell_arch(self):
-        self.assertEqual(rp_handler._parse_arch("sm_120"), (12, 0))
-        self.assertEqual(rp_handler._parse_arch("sm_100"), (10, 0))
+        self.assertEqual(arch_guard.parse_arch("sm_120"), (12, 0))
+        self.assertEqual(arch_guard.parse_arch("sm_100"), (10, 0))
 
     def test_arch_conditional_suffix_is_stripped(self):
-        self.assertEqual(rp_handler._parse_arch("sm_90a"), (9, 0))
+        self.assertEqual(arch_guard.parse_arch("sm_90a"), (9, 0))
 
     def test_ptx_entries_are_ignored(self):
-        self.assertIsNone(rp_handler._parse_arch("compute_120"))
+        self.assertIsNone(arch_guard.parse_arch("compute_120"))
+
+
+class TestArchCoverage(unittest.TestCase):
+    CU124 = ["sm_50", "sm_60", "sm_70", "sm_75", "sm_80", "sm_86", "sm_90"]
+    CU128 = ["sm_70", "sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"]
+
+    def test_forward_compatible_within_a_major(self):
+        # The whole reason the 4090 kept working: it is sm_89, nothing compiles
+        # for sm_89, and the sm_86 cubin covers it.
+        self.assertTrue(arch_guard.covers(["sm_86"], (8, 9)))
+        self.assertTrue(arch_guard.covers(["sm_80"], (8, 6)))
+
+    def test_not_backward_compatible(self):
+        self.assertFalse(arch_guard.covers(["sm_86"], (8, 0)))
+
+    def test_does_not_cross_major_versions(self):
+        # sm_90 kernels cannot carry a Blackwell card. This is the outage.
+        self.assertFalse(arch_guard.covers(self.CU124, (12, 0)))
+        self.assertTrue(arch_guard.covers(self.CU128, (12, 0)))
+
+    def test_every_required_capability_is_covered_by_cu128(self):
+        for cap in arch_guard.REQUIRED:
+            self.assertTrue(arch_guard.covers(self.CU128, cap), cap)
+
+    def test_cu124_misses_exactly_the_blackwell_capabilities(self):
+        uncovered = {c for c in arch_guard.REQUIRED if not arch_guard.covers(self.CU124, c)}
+        self.assertEqual(uncovered, {(10, 0), (12, 0)})
+
+    def test_empty_arch_list_covers_nothing(self):
+        # torch.cuda.get_arch_list() returns [] with no GPU visible. Reading the
+        # list that way on a CPU-only image builder reports every arch missing
+        # and fails the build — which is exactly what it did.
+        self.assertFalse(arch_guard.covers([], (8, 9)))
+
+    def test_compiled_archs_does_not_go_through_get_arch_list(self):
+        # The GPU-free path: _cuda_getArchFlags is a compile-time macro with no
+        # is_available() guard. If compiled_archs ever falls back to
+        # get_arch_list on a builder, the build breaks again.
+        flags = "sm_80 sm_86 sm_90 sm_120"
+        fake_C = types.SimpleNamespace(_cuda_getArchFlags=lambda: flags)
+        exploded = mock.Mock(side_effect=AssertionError("must not be called"))
+        with mock.patch.object(arch_guard.torch, "_C", fake_C, create=True), \
+                mock.patch.object(arch_guard.torch, "cuda",
+                                  types.SimpleNamespace(get_arch_list=exploded)):
+            self.assertEqual(arch_guard.compiled_archs(), flags.split())
+        exploded.assert_not_called()
 
 
 class TestDeviceSelection(unittest.TestCase):
@@ -293,10 +340,10 @@ class TestDeviceSelection(unittest.TestCase):
         cuda = types.SimpleNamespace(
             is_available=lambda: True,
             get_device_capability=lambda: capability,
-            get_arch_list=lambda: arch_list,
             get_device_name=lambda *a: name,
         )
-        with mock.patch.object(rp_handler.torch, "cuda", cuda), \
+        with mock.patch.object(rp_handler, "compiled_archs", lambda: arch_list), \
+                mock.patch.object(rp_handler.torch, "cuda", cuda), \
                 mock.patch.object(rp_handler.torch, "__version__", "x", create=True), \
                 mock.patch.object(rp_handler.torch, "version",
                                   types.SimpleNamespace(cuda="x"), create=True):

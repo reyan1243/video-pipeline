@@ -114,15 +114,24 @@ Two things make this non-obvious:
   was set, which is true on any CUDA build. RunPod's builder has no GPU, so
   nothing failed until a worker landed on the wrong card.
 
-Both are now closed:
+Both are now closed, by one shared module — `arch_guard.py`:
 
-* `Dockerfile.serverless` asserts `torch.cuda.get_arch_list()` contains
-  `sm_86`, `sm_90` and `sm_120`, and prints the full list. Needs no GPU, so it
-  fails the **build** rather than a worker.
-* `rp_handler._select_device()` compares the live card's capability against the
-  arch list at import and raises with the GPU name, its `sm_XX`, and the arch
-  list. It also refuses to fall back to CPU — that fallback used to run to the
-  900s execution timeout and bill for it.
+* **At build time**, `Dockerfile.serverless` runs `python /app/arch_guard.py`.
+  It prints the arch list and a per-GPU coverage table, then fails the build if
+  any capability in `arch_guard.REQUIRED` is uncovered.
+* **At worker start**, `rp_handler._select_device()` checks the live card's
+  capability against the same list and raises with the GPU name, its `sm_XX`,
+  and the arch list. It also refuses to fall back to CPU — that fallback used
+  to run to the 900s execution timeout and bill for it.
+
+⚠️ **Do not write this check with `torch.cuda.get_arch_list()`.** It returns
+`[]` when no GPU is visible (`torch/cuda/__init__.py` short-circuits on
+`is_available()`), so on RunPod's GPU-less builder it reports *every* arch as
+missing and fails a build that was fine. `arch_guard.compiled_archs()` reads
+`torch._C._cuda_getArchFlags()` instead — the compile-time macro underneath,
+with no such guard. This mistake already cost one red build.
+
+Adding a GPU type to the endpoint means adding its capability to `REQUIRED`.
 
 **If you must unblock without rebuilding:** deselect Blackwell types on the
 endpoint. 4090 (sm_89), A6000/A40 (sm_86) and L40S (sm_89) all run on cu124.

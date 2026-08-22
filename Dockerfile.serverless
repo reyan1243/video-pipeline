@@ -55,20 +55,19 @@ RUN grep -viE '^(torch|torchvision)[=<>]' requirements.txt > /tmp/requirements.d
     && pip install --no-cache-dir "runpod>=1.11.0,<1.12" boto3
 
 # Fail loudly here if the base image ever ships a CPU-only torch, or one whose
-# compiled kernels do not cover the GPUs this endpoint can land on.
+# compiled kernels do not cover the GPUs this endpoint can land on. The old
+# guard checked only `torch.version.cuda` — true of any CUDA build — which is
+# why the Blackwell mismatch got past the build and crashed a worker instead.
 #
-# get_arch_list() reads the arch list out of the binary and needs no GPU, so it
-# runs on RunPod's CPU builder. The old guard checked only `torch.version.cuda`,
-# which is why the Blackwell mismatch got past the build and surfaced as a
-# runtime crash on a worker instead.
-RUN python -c "\
-import torch, torchvision; \
-assert torch.version.cuda, 'torch has no CUDA support'; \
-archs = torch.cuda.get_arch_list(); \
-print('torch', torch.__version__, 'cuda', torch.version.cuda, 'tv', torchvision.__version__); \
-print('arch list:', archs); \
-missing = [a for a in ('sm_86', 'sm_90', 'sm_120') if a not in archs]; \
-assert not missing, f'base image lacks kernels for {missing}; arch list is {archs}'"
+# Copied on its own line, ahead of the weights, so editing it does not
+# invalidate the 1.8 GB download layer below.
+#
+# NB: this cannot use `torch.cuda.get_arch_list()`. That returns [] when no GPU
+# is visible, and RunPod's builder has none, so it reports every arch missing
+# and fails the build on a machine that was never going to have a GPU.
+# arch_guard reads the compile-time flags directly instead.
+COPY arch_guard.py /app/arch_guard.py
+RUN python /app/arch_guard.py
 
 # HF_HOME must be identical at build and run time, or the worker re-downloads
 # 1.8 GB on every cold start — on the meter, since start time is billed.
