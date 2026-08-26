@@ -2,14 +2,20 @@ opencv-python-headless
 numpy
 scipy
 pillow
-# cu124 wheels run on driver CUDA 12.4 and newer, which is the safe choice across
-# RunPod hosts. Install from https://download.pytorch.org/whl/cu124 — a bare
-# `pip install torch` resolves to a build that needs 12.8+ and fails at import.
+# cu128 wheels, from https://download.pytorch.org/whl/cu128. Needs a 570+ host
+# driver, and in exchange carries kernels for sm_120/sm_100 (Blackwell: RTX 5090,
+# RTX PRO 6000, B200). The older cu124 build stopped at sm_90, so any Blackwell
+# card died at import with "no kernel image is available for execution on the
+# device". sm_86 cubins still cover sm_89, so 4090/L40S are unaffected.
+#
 # torchvision is ABI-locked to a specific torch build; mismatching them breaks
 # every transformers import with `operator torchvision::nms does not exist`,
 # because transformers/image_utils.py imports torchvision at module load.
-torch==2.6.0
-torchvision==0.21.0
+#
+# Dockerfile.serverless strips these two lines and takes both from the base
+# image instead — keep the versions here matching that image's.
+torch==2.8.0
+torchvision==0.23.0
 # Sam2Model / Sam2VideoModel / Sam2VideoProcessor are recent, fast-moving APIs.
 transformers>=4.56,<5
 accelerate

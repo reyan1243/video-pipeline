@@ -17,10 +17,24 @@
 # Nothing can be pinned around a file that no longer exists, and any pip-resolved
 # CUDA stack is one upstream yank away from the same failure.
 #
-# This image ships torch 2.6.0, CUDA 12.4 and cuDNN 9 already matched, so there
-# is no resolution step to break. Same versions validated on the GPU pod, and
-# ~2.5 GB less to download at build time.
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+# This image ships torch, CUDA and cuDNN already matched, so there is no
+# resolution step to break, and ~2.5 GB less to download at build time.
+#
+# cu128, not cu124. torch 2.6.0+cu124 compiles kernels for sm_50..sm_90 only.
+# Blackwell cards (sm_120: RTX 5090, RTX PRO 6000; sm_100: B200) are outside
+# that list, and landing on one kills the worker at import with:
+#
+#     CUDA error: no kernel image is available for execution on the device
+#
+# That is an *architecture* mismatch, not a driver one — the endpoint's "CUDA
+# 12.4 and newer" filter gates on host driver version and lets Blackwell hosts
+# through happily. Only a cu128 build has the kernels. 2.8.0 is the smallest
+# jump that gets them; sm_86 cubins cover sm_89, so 4090/L40S keep working.
+#
+# Trade-off, deliberate: cu128 needs a 570+ host driver, so the endpoint's CUDA
+# filter must be raised to 12.8+ (see DEPLOY.md §3). That drops hosts stuck on
+# 12.4-12.7 and adds every Blackwell host — a much larger pool on net.
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg libgl1 libglib2.0-0 \
@@ -40,11 +54,20 @@ RUN grep -viE '^(torch|torchvision)[=<>]' requirements.txt > /tmp/requirements.d
     && pip install --no-cache-dir -r /tmp/requirements.docker.txt \
     && pip install --no-cache-dir "runpod>=1.11.0,<1.12" boto3
 
-# Fail loudly here if the base image ever ships a CPU-only torch.
-RUN python -c "\
-import torch, torchvision; \
-assert torch.version.cuda, 'torch has no CUDA support'; \
-print('torch', torch.__version__, 'cuda', torch.version.cuda, 'tv', torchvision.__version__)"
+# Fail loudly here if the base image ever ships a CPU-only torch, or one whose
+# compiled kernels do not cover the GPUs this endpoint can land on. The old
+# guard checked only `torch.version.cuda` — true of any CUDA build — which is
+# why the Blackwell mismatch got past the build and crashed a worker instead.
+#
+# Copied on its own line, ahead of the weights, so editing it does not
+# invalidate the 1.8 GB download layer below.
+#
+# NB: this cannot use `torch.cuda.get_arch_list()`. That returns [] when no GPU
+# is visible, and RunPod's builder has none, so it reports every arch missing
+# and fails the build on a machine that was never going to have a GPU.
+# arch_guard reads the compile-time flags directly instead.
+COPY arch_guard.py /app/arch_guard.py
+RUN python /app/arch_guard.py
 
 # HF_HOME must be identical at build and run time, or the worker re-downloads
 # 1.8 GB on every cold start — on the meter, since start time is billed.

@@ -63,7 +63,7 @@ Six of these differ from the defaults. Each one is a real failure otherwise.
 | Field | Value | Why |
 |---|---|---|
 | Endpoint type | **Queue** | Load-balancing endpoints cap at ~5.5 min of processing; our jobs run 2–5 min |
-| GPU priority | **RTX 4090 PRO** → A6000/A40 → L40S | **Availability**, not cost. Below five workers every worker uses the highest-priority type available, so this is pure fallback, not distribution. Listed cheapest-first because per-second rates differ materially: 4090 PRO $0.00031, A6000/A40 $0.00034, L40S $0.00053. A dearer card only breaks even if it is proportionally faster, which is unproven — do not assume it is free to fall back. |
+| GPU priority | **RTX 4090 PRO** → A6000/A40 → L40S → Blackwell | **Availability**, not cost. Below five workers every worker uses the highest-priority type available, so this is pure fallback, not distribution. Listed cheapest-first because per-second rates differ materially: 4090 PRO $0.00031, A6000/A40 $0.00034, L40S $0.00053. A dearer card only breaks even if it is proportionally faster, which is unproven — do not assume it is free to fall back. Blackwell cards (5090, RTX PRO 6000) are only safe on the cu128 image — see §3a. |
 | Active workers | **0** | Scale to zero. A single always-on worker is ~$790/mo. |
 | Max workers | **3** | Queue capacity is `max_workers × 100` |
 | GPUs per worker | **1** | Tracking is sequential; a second GPU idles |
@@ -72,10 +72,69 @@ Six of these differ from the defaults. Each one is a real failure otherwise.
 | Job TTL | **86400 s** | Clock starts at *submission* and includes queue time |
 | **Container disk** | **50 GB** *(default 20)* | Ephemeral scratch; the image alone is ~9 GB |
 | FlashBoot | **on** | Free. Snapshots the warmed worker → ~7s restarts instead of ~70s |
-| **CUDA version** | **12.4 and all newer** | The image ships cu124 wheels. Landing on an older driver reproduces `NVIDIA driver too old (found version 12040)` — the exact failure this repo was debugged through. CUDA is forward-compatible, so a wider selection means more available hardware. |
+| **CUDA version** | **12.8 and all newer** | The image ships cu128 wheels. Landing on an older driver reproduces `NVIDIA driver too old` — a failure this repo was debugged through. CUDA is forward-compatible, so a wider selection means more available hardware. **Do not lower this back to 12.4** to widen the pool: the driver filter says nothing about GPU *architecture*, and the cu124 image it used to imply had no Blackwell kernels — see §3a. |
 | Auto-scaling | **Request count**, value `1` | Default is queue-delay at 4s. Request count fans a burst out immediately rather than trickling. |
 | Data centers | **all** | Restricting shrinks the GPU pool |
 | Network volume | **none** | Pins the endpoint to one datacenter |
+
+### 3a. GPU architecture vs. driver version — they are different filters
+
+Symptom, seen in production: jobs succeed on a 4090 and every other card fails
+at worker start with
+
+```
+RuntimeError: CUDA initialization failed: Failed to initialize GPU 0:
+CUDA error: no kernel image is available for execution on the device
+```
+
+That is **not** a driver problem, and the CUDA-version dropdown will not fix it.
+It means the torch binary carries no compiled kernels for that GPU's compute
+capability.
+
+| | What it gates | What it does *not* gate |
+|---|---|---|
+| Endpoint **CUDA version** filter | Host **driver** version | GPU architecture |
+| Base image's **torch build** | GPU **architecture** | Driver version |
+
+A Blackwell host runs a 12.8+ driver, so it sails through a "12.4 and newer"
+filter — and then torch has nothing to execute on it.
+
+| torch build | Compiled for | Covers |
+|---|---|---|
+| 2.6.0 + cu124 *(previous)* | sm_50 … sm_90 | Maxwell → Hopper. **No Blackwell.** |
+| 2.8.0 + cu128 *(current)* | sm_75 … sm_120 | Turing → Blackwell |
+
+Two things make this non-obvious:
+
+* **The 4090 is sm_89 and no build compiles for it by name.** It runs on the
+  sm_86 cubin, because CUDA binaries are forward-compatible *within* a major
+  version. That compatibility does not cross majors, which is why sm_90 kernels
+  cannot carry an sm_120 card.
+* **The old build guard could not catch it.** It asserted `torch.version.cuda`
+  was set, which is true on any CUDA build. RunPod's builder has no GPU, so
+  nothing failed until a worker landed on the wrong card.
+
+Both are now closed, by one shared module — `arch_guard.py`:
+
+* **At build time**, `Dockerfile.serverless` runs `python /app/arch_guard.py`.
+  It prints the arch list and a per-GPU coverage table, then fails the build if
+  any capability in `arch_guard.REQUIRED` is uncovered.
+* **At worker start**, `rp_handler._select_device()` checks the live card's
+  capability against the same list and raises with the GPU name, its `sm_XX`,
+  and the arch list. It also refuses to fall back to CPU — that fallback used
+  to run to the 900s execution timeout and bill for it.
+
+⚠️ **Do not write this check with `torch.cuda.get_arch_list()`.** It returns
+`[]` when no GPU is visible (`torch/cuda/__init__.py` short-circuits on
+`is_available()`), so on RunPod's GPU-less builder it reports *every* arch as
+missing and fails a build that was fine. `arch_guard.compiled_archs()` reads
+`torch._C._cuda_getArchFlags()` instead — the compile-time macro underneath,
+with no such guard. This mistake already cost one red build.
+
+Adding a GPU type to the endpoint means adding its capability to `REQUIRED`.
+
+**If you must unblock without rebuilding:** deselect Blackwell types on the
+endpoint. 4090 (sm_89), A6000/A40 (sm_86) and L40S (sm_89) all run on cu124.
 
 ### On "load the models at deploy"
 
@@ -122,8 +181,41 @@ The variables below are the **standalone fallback**, used only when no
 | `BF16_WEIGHTS` | `1` — measured 22.0s → 16.8s model load, and halves resident VRAM |
 
 Optional, all with sane defaults: `MAX_DURATION_SECONDS` (300),
-`MAX_MASK_HEIGHT` (0 = source resolution), `MODEL_SIZE` (`large`),
-`MAX_SEGMENT_FRAMES` (600), `URL_TTL_SECONDS` (86400).
+`MAX_MASK_HEIGHT` (0 = let the worker choose — see §4a), `MODEL_SIZE` (`large`),
+`MAX_SEGMENT_FRAMES` (600), `URL_TTL_SECONDS` (86400),
+`LARGE_SOURCE_HEIGHT` (1440), `DEFAULT_LARGE_MASK_HEIGHT` (720).
+
+### 4a. How the matte's resolution is chosen
+
+A 4K matte carries no more real information than a 720p one — SAM2's decoder
+emits 256x256 logits and everything above that is interpolation — but it costs
+9x the host RAM, cleanup and encode time. So the worker picks a cap:
+
+1. An explicit `max_mask_height` in the request **wins**, untouched, even if it
+   will not fit. Substituting silently would return a matte at a resolution
+   nobody asked for; the guard refuses instead and names one that works.
+2. Otherwise, a source taller than `LARGE_SOURCE_HEIGHT` (1440) gets
+   `DEFAULT_LARGE_MASK_HEIGHT` (720). 1080p and below are left at source.
+3. If that still exceeds `MAX_MASK_BYTES`, it drops to the largest height that
+   fits.
+4. Only if nothing fits is the job refused as `too_large`.
+
+**Frame rate is not a special case** — it is already inside the frame count, so
+a 300s 60fps clip and a 600s 30fps one get the same answer. That is what makes
+step 3 cover high-fps sources without a separate rule:
+
+| clip | applied cap | mask RAM |
+|---|---|---|
+| 20s 60fps 4K | 720 | 1.0 GB |
+| 162s 30fps 4K | 720 | 4.2 GB |
+| 300s 60fps 4K | 480 | 6.9 GB |
+| 300s 30fps 1080p | 720 | 7.7 GB |
+| 10s 30fps 1080p | source | 0.6 GB |
+
+⚠️ **The matte ships at mask resolution**, not source resolution
+(`exporter.py`), so the delivered file *is* this size. The response returns
+`applied_max_mask_height` alongside `width`/`height` — read them rather than
+assuming the source dimensions.
 
 > After the first deploy, check the worker log for a credential starting with
 > `{{`. RunPod's `{{ RUNPOD_SECRET_name }}` substitution is documented for Pods
@@ -204,7 +296,7 @@ from a crash — so caller-actionable problems come back as `ok: false` instead.
 | `invalid_range` | `start_time` negative, or `end_time` <= `start_time` |
 | `source_unavailable` | the URL 4xx'd or was unreachable. **A 401/403 usually means the presigned URL expired while the job sat in the queue** — sign it for longer than the job TTL. |
 | `too_long` | over `MAX_DURATION_SECONDS` — pass `start_time`/`end_time` |
-| `too_large` | over the mask-RAM guard — downscale or shorten |
+| `too_large` | over the mask-RAM guard *after* auto-capping (§4a), so in practice only an explicit `max_mask_height` that overflows, or a clip no height rescues. The response carries `suggested_max_mask_height`; `null` means only trimming helps. |
 | `incomplete_coverage` | subject lost — better prompt, or split the clip |
 | `invalid_input` | unfetchable URL, oversized file, unusable frame rate |
 | `ffmpeg_failed` | trim or probe failed |
@@ -235,7 +327,7 @@ cancel early when a user abandons.
 | `mask_close_kernel_size` | `7` | larger values swallow arm-to-torso gaps |
 | `feather_sigma` | `1.0` | edge softness in px; `0` = hard edge |
 | `temporal_smoothing` | `false` | measured jitter is already 0.2–0.65px, so leave off |
-| `max_mask_height` | `0` | `960` on a 1080p source quarters cleanup/encode for ~no quality loss |
+| `max_mask_height` | `0` | `0` lets the worker choose (§4a): 4K+ is capped at 720, and long or high-fps clips drop further. Set it to override — an explicit value always wins, and is refused rather than substituted if it does not fit. |
 
 ---
 
@@ -308,5 +400,5 @@ workers. If the balance is low, raising max workers may silently not take.
 7. **Updates need a GitHub release**, not a push. RunPod's launch blog says otherwise and is stale.
 8. **Container disk is ephemeral** and wiped on restart.
 9. **An idle endpoint scales its own max workers to 0 after 7 days** and stays there — see §8b.
-10. **CUDA selection left unset** can land the cu124 image on an older driver.
+10. **CUDA selection left unset** can land the image on an older driver. And note it gates the *driver*, not the GPU architecture — a permissive setting still lets an unsupported card through. See §3a.
 11. **Async results are retained only 30 minutes.** A 404 from `/status` is terminal — the job was deleted, not delayed. `settleJob` already treats it that way.
