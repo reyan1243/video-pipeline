@@ -376,6 +376,144 @@ class TestAutoCapThroughHandler(TestGuards):
         self.assertEqual((out["width"], out["height"]), (1280, 720))
 
 
+class TestBatchedRanges(unittest.TestCase):
+    """Several portions in ONE job.
+
+    A caller masking four scattered captions used to send four jobs: four worker
+    starts, four downloads of the same video, for the same GPU work. These prove
+    the fixed cost is now paid once and that one bad portion cannot take the
+    others down with it.
+    """
+
+    META = types.SimpleNamespace(frame_count=300, width=1080, height=1920, fps=30.0)
+    PROBE = {"width": 1080, "height": 1920, "duration": 10.0}
+
+    def _run(self, job_input, download=None, per_range=None):
+        download = download or mock.MagicMock(return_value="deadbeef")
+        with mock.patch.object(rp_handler, "_remote_identity", return_value=None), \
+             mock.patch.object(rp_handler, "_download", download), \
+             mock.patch.object(rp_handler, "_already_done", return_value=False), \
+             mock.patch.object(rp_handler, "_trim", side_effect=lambda s, d, a, b: s), \
+             mock.patch.object(rp_handler, "_probe", return_value=self.PROBE), \
+             mock.patch.object(rp_handler, "VideoSource") as vs:
+            vs.return_value.load_metadata.return_value = self.META
+            if per_range is not None:
+                with mock.patch.object(rp_handler, "_process_range", side_effect=per_range):
+                    return rp_handler.handler({"id": "j", "input": job_input}), download
+            return rp_handler.handler({"id": "j", "input": job_input}), download
+
+    def test_downloads_the_video_once_for_every_range(self):
+        # The whole point: the fixed cost is paid once, not per portion.
+        out, download = self._run(
+            {
+                "video_url": "https://x/v.mp4",
+                "ranges": [
+                    {"start_time": 0, "end_time": 2, "matte_key": "a.mp4"},
+                    {"start_time": 8, "end_time": 9, "matte_key": "b.mp4"},
+                    {"start_time": 20, "end_time": 24, "matte_key": "c.mp4"},
+                ],
+            },
+            per_range=lambda *a, **k: {"ok": True, "matte_key": "x"},
+        )
+        self.assertEqual(download.call_count, 1)
+        self.assertEqual(len(out["results"]), 3)
+
+    def test_one_bad_portion_does_not_sink_the_others(self):
+        # Partial success on purpose: a subject who walks out of frame during one
+        # portion must not throw away GPU time already spent on the rest.
+        calls = iter(
+            [
+                {"ok": True, "matte_key": "a.mp4"},
+                {"ok": False, "code": "incomplete_coverage", "matte_key": "b.mp4"},
+                {"ok": True, "matte_key": "c.mp4"},
+            ]
+        )
+        out, _ = self._run(
+            {
+                "video_url": "https://x/v.mp4",
+                "ranges": [{"matte_key": k} for k in ("a.mp4", "b.mp4", "c.mp4")],
+            },
+            per_range=lambda *a, **k: next(calls),
+        )
+        self.assertIs(out["ok"], True)
+        self.assertEqual([r["ok"] for r in out["results"]], [True, False, True])
+
+    def test_every_portion_failing_reports_the_job_as_failed(self):
+        out, _ = self._run(
+            {"video_url": "https://x/v.mp4", "ranges": [{"matte_key": "a"}, {"matte_key": "b"}]},
+            per_range=lambda *a, **k: {"ok": False, "code": "incomplete_coverage"},
+        )
+        self.assertIs(out["ok"], False)
+
+    def test_a_range_carries_its_own_matte_key_through_a_rejection(self):
+        # The caller settles each portion against its own row, and the key is the
+        # only thing tying a result back to one. A rejection without it is unusable.
+        out, _ = self._run(
+            {
+                "video_url": "https://x/v.mp4",
+                "ranges": [{"start_time": 0, "end_time": 2, "matte_key": "wanted.mp4"}],
+            },
+            per_range=None,
+        )
+        self.assertEqual(out["results"][0].get("matte_key"), "wanted.mp4")
+
+    def test_invalid_ranges_are_refused_before_the_download(self):
+        # An invalid range is a caller bug, not something the footage can settle.
+        # Paying for a 67 MB fetch to discover it would be pure waste.
+        out, download = self._run(
+            {"video_url": "https://x/v.mp4", "ranges": [{"start_time": 30, "end_time": 10}]}
+        )
+        self.assertEqual(out["code"], "invalid_range")
+        self.assertEqual(download.call_count, 0)
+
+    def test_a_good_range_still_runs_beside_an_invalid_one(self):
+        out, download = self._run(
+            {
+                "video_url": "https://x/v.mp4",
+                "ranges": [{"start_time": 30, "end_time": 10}, {"start_time": 0, "end_time": 2}],
+            },
+            per_range=lambda *a, **k: {"ok": True},
+        )
+        self.assertEqual(download.call_count, 1)
+        self.assertEqual(len(out["results"]), 2)
+
+    def test_a_crash_in_one_portion_keeps_the_others(self):
+        # The mattes for the good portions are already uploaded by the time a
+        # later one blows up. Letting the exception escape would throw away GPU
+        # time that has been spent and cannot be recovered.
+        def side_effect(job, source, workdir, index, rng, *a, **k):
+            if index == 1:
+                raise RuntimeError("cuda blew up")
+            return {"ok": True, "matte_key": rng["matte_key"]}
+
+        with mock.patch.object(rp_handler, "_process_range", side_effect=side_effect):
+            out, _ = self._run(
+                {
+                    "video_url": "https://x/v.mp4",
+                    "ranges": [{"matte_key": k} for k in ("a", "b", "c")],
+                }
+            )
+
+        self.assertIs(out["ok"], True)
+        self.assertEqual([bool(r.get("ok")) for r in out["results"]], [True, False, True])
+        # The crash is reported as an error for that portion alone, still keyed
+        # so the caller can settle the right row.
+        self.assertIn("cuda blew up", out["results"][1]["error"])
+        self.assertEqual(out["results"][1]["matte_key"], "b")
+
+    def test_the_old_single_range_shape_still_works(self):
+        # Deploy skew runs in both directions: an older caller must keep working
+        # against a newer worker.
+        out, _ = self._run(
+            {"video_url": "https://x/v.mp4", "start_time": 1, "end_time": 3, "matte_key": "legacy.mp4"},
+            per_range=lambda *a, **k: {"ok": True, "matte_key": "legacy.mp4", "width": 1080},
+        )
+        self.assertIs(out["ok"], True)
+        # Flattened to the old top-level shape as well as the new results array.
+        self.assertEqual(out["matte_key"], "legacy.mp4")
+        self.assertEqual(out["width"], 1080)
+        self.assertEqual(len(out["results"]), 1)
+
 class TestEdgeCases(unittest.TestCase):
     def test_negative_start_time_is_refused(self):
         out = rp_handler.handler({"id": "j", "input": {"video_url": "https://x/v.mp4", "start_time": -5}})

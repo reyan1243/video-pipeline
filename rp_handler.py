@@ -451,6 +451,46 @@ def _auto_mask_height(width: int, height: int, frame_count: int, requested: int)
     return cap if fitting is None else fitting
 
 
+def _parse_ranges(job_input: dict) -> list[dict]:
+    """The portions to mask, as an explicit list.
+
+    A caller masking four scattered captions used to send four jobs. Each booked
+    its own worker, paid its own cold start, and downloaded the same video again —
+    so the fixed cost was multiplied by the number of portions while the actual
+    GPU work stayed the same. One job carrying every range pays that once.
+
+    The legacy single-range shape is still accepted so an older caller keeps
+    working through a deploy skew in either direction.
+    """
+    ranges = job_input.get("ranges")
+    if isinstance(ranges, list) and ranges:
+        return [dict(r) for r in ranges if isinstance(r, dict)]
+    return [
+        {
+            "start_time": job_input.get("start_time"),
+            "end_time": job_input.get("end_time"),
+            "matte_key": job_input.get("matte_key"),
+            "upload_url": job_input.get("upload_url"),
+        }
+    ]
+
+
+def _range_bounds(rng: dict) -> tuple:
+    """(start, end, rejection). Validated per range so one bad range cannot sink the rest."""
+    start = rng.get("start_time")
+    end = rng.get("end_time")
+    start = float(start) if start is not None else None
+    end = float(end) if end is not None else None
+
+    if start is not None and start < 0:
+        return start, end, _rejected("invalid_range", "start_time cannot be negative")
+    if end is not None and start is not None and end <= start:
+        return start, end, _rejected(
+            "invalid_range", f"end_time ({end}) must be after start_time ({start})"
+        )
+    return start, end, None
+
+
 def _put_presigned(local: Path, url: str, content_type: str = "video/mp4") -> None:
     """Upload via a presigned PUT supplied by the caller.
 
@@ -490,6 +530,213 @@ def _cleanup(workdir: Path) -> None:
 # --------------------------------------------------------------------------
 
 
+def _exception_result(exc: Exception) -> dict:
+    """Map an exception to the caller-actionable result it deserves.
+
+    Shared by the whole-job handler and the per-range loop so a failure means the
+    same thing wherever it happens. Anything not listed is a genuine crash and
+    keeps the "error" key, which marks the RunPod job FAILED.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        hint = (
+            " The presigned URL may have expired while the job sat in the queue — "
+            "sign it for longer than the job's TTL."
+            if exc.code in (401, 403)
+            else ""
+        )
+        return _rejected("source_unavailable", f"could not fetch the video: HTTP {exc.code}.{hint}")
+    if isinstance(exc, urllib.error.URLError):
+        return _rejected("source_unavailable", f"could not reach the video URL: {exc.reason}")
+    if isinstance(exc, ValueError):
+        # Guard rejections (oversize download, unusable fps, no detection) — all
+        # caller-actionable, so COMPLETED with ok=False rather than FAILED.
+        return _rejected("invalid_input", str(exc))
+    if isinstance(exc, subprocess.CalledProcessError):
+        detail = (exc.stderr or b"").decode(errors="replace")[-500:] if exc.stderr else ""
+        return _rejected("ffmpeg_failed", f"ffmpeg failed: {detail}")
+    return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _process_range(job, source: Path, workdir: Path, index: int, rng: dict, base_identity, base_params: dict, opts: dict) -> dict:
+    """Mask one portion of an already-downloaded video.
+
+    Everything expensive that a portion does NOT need repeating — the download,
+    the resident models — happens once in the caller. What is left here is the
+    only work that genuinely scales with the number of portions.
+
+    The mask-height cap is resolved per portion, not once for the job: a four
+    second portion and a four minute one project wildly different mask memory, so
+    a single cap would either refuse the short one needlessly or let the long one
+    through to OOM.
+    """
+    start_time, end_time, bad = _range_bounds(rng)
+    upload_url = rng.get("upload_url") or opts.get("upload_url")
+    upload_key = rng.get("matte_key") or opts.get("matte_key")
+    if bad:
+        return {**bad, "matte_key": upload_key, "start_time": start_time, "end_time": end_time}
+
+    max_mask_height = opts["max_mask_height"]
+    params = {**base_params, "start": start_time, "end": end_time}
+    label = f"range {index + 1}/{opts['total']}"
+
+    # The worker's own content cache addresses its own bucket. When the caller
+    # supplied a presigned PUT it owns the key and the bucket, and a hit here
+    # would return a key it never asked for while uploading nothing to the URL it
+    # gave us — so the cache is only consulted when we are the one storing.
+    key = _output_key(base_identity, params) if base_identity else None
+    if not upload_url and key is not None and _already_done(key):
+        return {
+            "ok": True,
+            "matte_key": key,
+            "matte_url": _presign(key),
+            "cached": True,
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+
+    clip = _trim(source, workdir / f"clip-{index}.mp4", start_time, end_time)
+
+    info = _probe(clip)
+    if info["duration"] > MAX_DURATION_SECONDS:
+        return _rejected(
+            "too_long",
+            f"clip is {info['duration']:.1f}s, limit is {MAX_DURATION_SECONDS:.0f}s. "
+            "Pass start_time/end_time to process only the range you need, or split it.",
+            duration=info["duration"],
+            matte_key=upload_key,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    runpod.serverless.progress_update(job, f"{label}: reading metadata")
+    video = VideoSource(clip)
+    metadata = video.load_metadata()
+
+    # Resolve the cap before measuring: a large source gets one applied for it,
+    # and the tracker honours it a few lines below. Projecting from the source
+    # instead refused 4K jobs whose masks were never going to be stored at 4K —
+    # while advising a downscale that had already happened.
+    applied_mask_height = _auto_mask_height(
+        metadata.width, metadata.height, metadata.frame_count, max_mask_height
+    )
+    projected = _projected_mask_bytes(
+        metadata.width, metadata.height, metadata.frame_count, applied_mask_height
+    )
+    if projected > MAX_MASK_BYTES:
+        suggested = _largest_fitting_height(
+            metadata.width, metadata.height, metadata.frame_count
+        )
+        actionable = suggested is not None and (
+            applied_mask_height <= 0 or suggested < applied_mask_height
+        )
+        advice = (
+            f"Pass max_mask_height={suggested} to cap the masks, or use "
+            "start_time/end_time to process a shorter range."
+            if actionable
+            else "No mask height is small enough at this length — use "
+            "start_time/end_time to process a shorter range."
+        )
+        return _rejected(
+            "too_large",
+            f"job would need ~{projected / 1024**3:.1f} GB of mask memory "
+            f"(limit {MAX_MASK_BYTES / 1024**3:.1f} GB). {advice}",
+            frames=metadata.frame_count,
+            resolution=f"{metadata.width}x{metadata.height}",
+            projected_gb=round(projected / 1024**3, 1),
+            max_mask_height=max_mask_height,
+            applied_max_mask_height=applied_mask_height,
+            suggested_max_mask_height=suggested,
+            matte_key=upload_key,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    # TrackerConfig is frozen, so a per-request override rebuilds it. The
+    # tracker reads self.config on every frame, so reassigning is enough.
+    _tracker.config = replace(_TRACKER_CONFIG, max_mask_height=applied_mask_height)
+
+    _detector.prompt = _normalize_prompt(opts["prompt"])
+    _segmenter.num_candidates = opts["num_seed_candidates"]
+    _tracker.video = video
+
+    runpod.serverless.progress_update(job, f"{label}: selecting seed frame")
+    seed = _segmenter.select_seed(video, metadata)
+
+    runpod.serverless.progress_update(job, f"{label}: tracking {metadata.frame_count} frames")
+    tracking = _tracker.track(seed, metadata)
+
+    coverage = tracking.coverage(metadata.frame_count)
+    if coverage < 1.0:
+        missing = metadata.frame_count - len(tracking.masks)
+        return _rejected(
+            "incomplete_coverage",
+            f"tracking covered {coverage:.1%} of frames ({missing} missing). "
+            "Every frame needs a mask. Try a more specific prompt, or split the "
+            "clip where the subject leaves frame.",
+            coverage=coverage,
+            matte_key=upload_key,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    runpod.serverless.progress_update(job, f"{label}: cleaning masks")
+    clean_masks(tracking.masks, opts["close_kernel"], opts["feather_sigma"])
+    if opts["smoothing"]:
+        temporal_median(tracking.masks)
+
+    runpod.serverless.progress_update(job, f"{label}: encoding matte")
+    exporter = LayerExporter(video, output_dir=workdir / f"out-{index}")
+    export = exporter.export(tracking, metadata, person_format="matte")
+
+    runpod.serverless.progress_update(job, f"{label}: uploading")
+
+    if upload_url:
+        _put_presigned(Path(export.matte_path), upload_url, opts["upload_content_type"])
+        # The caller chose the key and owns the bucket, so it can presign a GET
+        # itself — we have no credentials to do so and should not.
+        stored_key, stored_url = upload_key, None
+    else:
+        stored_key, stored_url = key, _upload(Path(export.matte_path), key)
+
+    return {
+        "ok": True,
+        # The key is the durable reference — store this. The URL is a convenience
+        # for testing and expires after URL_TTL_SECONDS; callers should
+        # re-presign from the key rather than persist the URL.
+        "matte_key": stored_key,
+        "matte_url": stored_url,
+        "cached": False,
+        "start_time": start_time,
+        "end_time": end_time,
+        "frames": metadata.frame_count,
+        "fps": metadata.fps,
+        "width": export.width,
+        "height": export.height,
+        # The matte ships at mask resolution, so a caller that did not pick the
+        # cap still needs to know which one was applied for it.
+        "applied_max_mask_height": applied_mask_height,
+        "seed_frame": seed.frame_index,
+        "seed_iou": round(seed.iou_score, 3),
+        "coverage": 1.0,
+    }
+
+
+def _safe_process_range(job, source, workdir, index, rng, base_identity, base_params, opts) -> dict:
+    """One portion, with its failure contained to itself.
+
+    Without this an exception in the third portion would discard the mattes
+    already uploaded for the first two — GPU time that was spent and cannot be
+    recovered. The key rides along so the caller can settle the failure against
+    the right row.
+    """
+    try:
+        return _process_range(job, source, workdir, index, rng, base_identity, base_params, opts)
+    except Exception as exc:  # noqa: BLE001 — contained on purpose; see docstring
+        key = rng.get("matte_key") or opts.get("matte_key")
+        start, end, _ = _range_bounds(rng)
+        return {**_exception_result(exc), "matte_key": key, "start_time": start, "end_time": end}
+
+
 def handler(job):
     with _JOB_LOCK:
         return _handle(job)
@@ -515,27 +762,26 @@ def _handle(job):
     upload_key = job_input.get("matte_key")
     upload_content_type = str(job_input.get("upload_content_type", "video/mp4"))
 
-    start_time = job_input.get("start_time")
-    end_time = job_input.get("end_time")
-    start_time = float(start_time) if start_time is not None else None
-    end_time = float(end_time) if end_time is not None else None
+    ranges = _parse_ranges(job_input)
+    if not ranges:
+        return _rejected("missing_input", "no ranges to mask")
 
-    if start_time is not None and start_time < 0:
-        return _rejected("invalid_range", "start_time cannot be negative")
-    if end_time is not None and start_time is not None and end_time <= start_time:
-        return _rejected(
-            "invalid_range", f"end_time ({end_time}) must be after start_time ({start_time})"
-        )
+    # Bounds are checked here, before the download, because an invalid range is a
+    # caller bug rather than something the footage can settle — paying for a
+    # 67 MB fetch to discover it would be pure waste. Only when EVERY range is
+    # invalid does the job refuse outright; otherwise the good ranges proceed and
+    # the bad ones come back as their own rejections.
+    invalid = [bad for bad in (_range_bounds(r)[2] for r in ranges) if bad]
+    if len(invalid) == len(ranges):
+        return invalid[0]
 
-    params = {
+    base_params = {
         "prompt": prompt,
         "candidates": num_seed_candidates,
         "close": close_kernel,
         "feather": feather_sigma,
         "smoothing": smoothing,
         "max_mask_height": max_mask_height,
-        "start": start_time,
-        "end": end_time,
         "model": _MODEL_ID,
     }
 
@@ -545,177 +791,52 @@ def _handle(job):
     try:
         source = workdir / "input.mp4"
 
-        # Identify the source before fetching it. A cache hit then costs one
-        # ranged request instead of a full download — tens of seconds of billed
-        # transfer on a 67 MB clip, for a result we already hold.
+        # Identify the source before fetching it, so the per-range cache lookups
+        # below share one identity rather than each hashing the file again.
         identity = _remote_identity(video_url)
-        key = _output_key(identity, params) if identity else None
-
-        if key is not None and _already_done(key):
-            # Same bytes, same settings — a duplicate submission or a requeue after
-            # a heartbeat lapse. Returning the existing object costs nothing.
-            return {
-                "ok": True,
-                "matte_key": key,
-                "matte_url": _presign(key),
-                "cached": True,
-                "processing_seconds": round(time.time() - started, 1),
-                "url_expires_in_seconds": URL_TTL_SECONDS,
-            }
-
         content_hash = _download(video_url, source)
-        if key is None:
-            # The origin gave us nothing to identify it by, so fall back to
-            # hashing the bytes: same guarantee, just paid for after the fact.
-            key = _output_key(content_hash, params)
-            if _already_done(key):
-                return {
-                    "ok": True,
-                    "matte_key": key,
-                    "matte_url": _presign(key),
-                    "cached": True,
-                    "processing_seconds": round(time.time() - started, 1),
-                    "url_expires_in_seconds": URL_TTL_SECONDS,
-                }
+        base_identity = identity or content_hash
 
-        clip = _trim(source, workdir / "clip.mp4", start_time, end_time)
-
-        info = _probe(clip)
-        if info["duration"] > MAX_DURATION_SECONDS:
-            return _rejected(
-                "too_long",
-                f"clip is {info['duration']:.1f}s, limit is {MAX_DURATION_SECONDS:.0f}s. "
-                "Pass start_time/end_time to process only the range you need, or split it.",
-                duration=info["duration"],
-            )
-
-        runpod.serverless.progress_update(job, "reading metadata")
-        video = VideoSource(clip)
-        metadata = video.load_metadata()
-
-        # Resolve the cap before measuring: a large source gets one applied for
-        # it, and the tracker honours it a few lines below. Projecting from the
-        # source instead refused 4K jobs whose masks were never going to be
-        # stored at 4K — while advising a downscale that had already happened.
-        applied_mask_height = _auto_mask_height(
-            metadata.width, metadata.height, metadata.frame_count, max_mask_height
-        )
-        projected = _projected_mask_bytes(
-            metadata.width, metadata.height, metadata.frame_count, applied_mask_height
-        )
-        if projected > MAX_MASK_BYTES:
-            suggested = _largest_fitting_height(
-                metadata.width, metadata.height, metadata.frame_count
-            )
-            actionable = suggested is not None and (
-                applied_mask_height <= 0 or suggested < applied_mask_height
-            )
-            advice = (
-                f"Pass max_mask_height={suggested} to cap the masks, or use "
-                "start_time/end_time to process a shorter range."
-                if actionable
-                else "No mask height is small enough at this length — use "
-                "start_time/end_time to process a shorter range."
-            )
-            return _rejected(
-                "too_large",
-                f"job would need ~{projected / 1024**3:.1f} GB of mask memory "
-                f"(limit {MAX_MASK_BYTES / 1024**3:.1f} GB). {advice}",
-                frames=metadata.frame_count,
-                resolution=f"{metadata.width}x{metadata.height}",
-                projected_gb=round(projected / 1024**3, 1),
-                max_mask_height=max_mask_height,
-                applied_max_mask_height=applied_mask_height,
-                suggested_max_mask_height=suggested,
-            )
-
-        # TrackerConfig is frozen, so a per-request override rebuilds it. The
-        # tracker reads self.config on every frame, so reassigning is enough.
-        _tracker.config = replace(_TRACKER_CONFIG, max_mask_height=applied_mask_height)
-
-        _detector.prompt = _normalize_prompt(prompt)
-        _segmenter.num_candidates = num_seed_candidates
-        _tracker.video = video
-
-        runpod.serverless.progress_update(job, "selecting seed frame")
-        seed = _segmenter.select_seed(video, metadata)
-
-        runpod.serverless.progress_update(job, f"tracking {metadata.frame_count} frames")
-        tracking = _tracker.track(seed, metadata)
-
-        coverage = tracking.coverage(metadata.frame_count)
-        if coverage < 1.0:
-            missing = metadata.frame_count - len(tracking.masks)
-            return _rejected(
-                "incomplete_coverage",
-                f"tracking covered {coverage:.1%} of frames ({missing} missing). "
-                "Every frame needs a mask. Try a more specific prompt, or split the "
-                "clip where the subject leaves frame.",
-                coverage=coverage,
-            )
-
-        runpod.serverless.progress_update(job, "cleaning masks")
-        clean_masks(tracking.masks, close_kernel, feather_sigma)
-        if smoothing:
-            temporal_median(tracking.masks)
-
-        runpod.serverless.progress_update(job, "encoding matte")
-        exporter = LayerExporter(video, output_dir=workdir / "out")
-        export = exporter.export(tracking, metadata, person_format="matte")
-
-        runpod.serverless.progress_update(job, "uploading")
-
-        if upload_url:
-            _put_presigned(Path(export.matte_path), upload_url, upload_content_type)
-            # The caller chose the key and owns the bucket, so it can presign a
-            # GET itself — we have no credentials to do so and should not.
-            stored_key, stored_url = upload_key, None
-        else:
-            stored_key, stored_url = key, _upload(Path(export.matte_path), key)
-
-        return {
-            "ok": True,
-            # The key is the durable reference — store this. The URL is a
-            # convenience for testing and expires after URL_TTL_SECONDS; callers
-            # should re-presign from the key rather than persist the URL.
-            "matte_key": stored_key,
-            "matte_url": stored_url,
-            "cached": False,
-            "frames": metadata.frame_count,
-            "fps": metadata.fps,
-            "width": export.width,
-            "height": export.height,
-            # The matte ships at mask resolution, so a caller that did not pick
-            # the cap still needs to know which one was applied for it.
-            "applied_max_mask_height": applied_mask_height,
-            "seed_frame": seed.frame_index,
-            "seed_iou": round(seed.iou_score, 3),
-            "coverage": 1.0,
+        opts = {
             "prompt": prompt,
-            "processing_seconds": round(time.time() - started, 1),
-            "url_expires_in_seconds": URL_TTL_SECONDS,
+            "num_seed_candidates": num_seed_candidates,
+            "close_kernel": close_kernel,
+            "feather_sigma": feather_sigma,
+            "smoothing": smoothing,
+            "max_mask_height": max_mask_height,
+            "upload_url": upload_url,
+            "matte_key": upload_key,
+            "upload_content_type": upload_content_type,
+            "total": len(ranges),
         }
 
-    except urllib.error.HTTPError as exc:
-        hint = (
-            " The presigned URL may have expired while the job sat in the queue — "
-            "sign it for longer than the job's TTL."
-            if exc.code in (401, 403)
-            else ""
-        )
-        return _rejected("source_unavailable", f"could not fetch the video: HTTP {exc.code}.{hint}")
-    except urllib.error.URLError as exc:
-        return _rejected("source_unavailable", f"could not reach the video URL: {exc.reason}")
-    except ValueError as exc:
-        # Guard rejections (oversize download, unusable fps, no detection) — all
-        # caller-actionable, so COMPLETED with ok=False rather than FAILED.
-        return _rejected("invalid_input", str(exc))
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or b"").decode(errors="replace")[-500:] if exc.stderr else ""
-        return _rejected("ffmpeg_failed", f"ffmpeg failed: {detail}")
-    except Exception as exc:  # noqa: BLE001 — surface the real failure to the caller
+        results = [
+            _safe_process_range(job, source, workdir, i, rng, base_identity, base_params, opts)
+            for i, rng in enumerate(ranges)
+        ]
+
+        # Partial success on purpose: one range whose subject walks out of frame
+        # must not throw away the GPU time already spent on the others. The
+        # caller settles each portion against its own result.
+        payload = {
+            "ok": any(bool(r.get("ok")) for r in results),
+            "results": results,
+            "processing_seconds": round(time.time() - started, 1),
+            "url_expires_in_seconds": URL_TTL_SECONDS,
+            "prompt": prompt,
+        }
+
+        # A single-range job also answers in the old shape, so a caller from
+        # before this change keeps working through a deploy in either order.
+        if len(results) == 1:
+            payload = {**results[0], **payload}
+        return payload
+    except Exception as exc:  # noqa: BLE001 — mapped, then surfaced to the caller
+        # Only the shared phase reaches here — the download and identity work that
+        # every range depends on. A per-range failure is contained by
+        # _safe_process_range and never reaches this.
         return {
-            "error": f"{type(exc).__name__}: {exc}",
+            **_exception_result(exc),
             "processing_seconds": round(time.time() - started, 1),
         }
     finally:
